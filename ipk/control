@@ -1,5 +1,5 @@
 Package: luci-app-xboxaccel
-Version: 1.0.0-1
+Version: 1.1.0-1
 Depends: libc, luci-base, curl
 Architecture: all
 Installed-Size: 16
@@ -7,4 +7,4 @@ Section: luci
 License: Apache-2.0
 Maintainer: xboxaccel
 Description: Xbox download CDN selector for OpenWrt.
- Writes dnsmasq address records so clients using this router's port 53 resolve Xbox download hostnames to a chosen CDN address.
+ Keeps separate primary and legacy addresses, suppresses AAAA for those names, and checks dnsmasq before leaving a new record in place.

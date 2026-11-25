@@ -1,24 +1,82 @@
 #!/bin/sh
-# SPDX-License-Identifier: Apache-2.0
-# Xbox download CDN selector. DNS address records only.
+# Facade for the Xbox CDN selector.
+# Callers only use: apply, clear, test, test-bg, tick, use, probe, probe-bg, stop, preview, check, log.
+# Selection rules live in /usr/share/xboxaccel/policy.
+# Which addresses get measured lives in /usr/share/xboxaccel/roster.
 
 DOMAINS=/usr/share/xboxaccel/domains
 NODES=/usr/share/xboxaccel/nodes.tsv
+POLICY=/usr/share/xboxaccel/policy
+ROSTER=/usr/share/xboxaccel/roster
 STATUS=/tmp/xboxaccel.status
 RESULTS=/tmp/xboxaccel.results
+HISTORY=/tmp/xboxaccel.history
+CATALOG=/tmp/xboxaccel.catalog
 PARTS=/tmp/xboxaccel.parts
 LAST=/tmp/xboxaccel.last
+GEN=/tmp/xboxaccel.gen
+STOP=/tmp/xboxaccel.stop
 LOCK=/var/run/xboxaccel.lock
 CRON_FILE=/etc/crontabs/root
 CRON_LINE='*/5 * * * * /usr/sbin/xboxaccel tick # xboxaccel'
 CONF_NAME=xboxaccel.conf
+LOG=/tmp/xboxaccel.log
 
 log() {
-	logger -t xboxaccel "$*"
+	local lines
+	logger -t xboxaccel "$*" 2>/dev/null || true
+	printf '%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> "$LOG" 2>/dev/null || return 0
+	lines=$(awk 'END { print NR + 0 }' "$LOG" 2>/dev/null || echo 0)
+	[ "$lines" -le 300 ] && return 0
+	tail -n 200 "$LOG" > "$LOG.part" 2>/dev/null && mv "$LOG.part" "$LOG"
+}
+
+# Copy older syslog lines into the plugin journal once.
+# Later reads stay on this file, so the page never opens the system log.
+seed_log() {
+	local seeded
+	[ -f "$LOG.seed" ] && return 0
+	: > "$LOG.seed"
+	command -v logread >/dev/null 2>&1 || return 0
+	seeded=$(mktemp) || return 0
+	logread -e 'xboxaccel' 2>/dev/null | awk '
+		BEGIN {
+			m["Jan"]="01"; m["Feb"]="02"; m["Mar"]="03"; m["Apr"]="04"
+			m["May"]="05"; m["Jun"]="06"; m["Jul"]="07"; m["Aug"]="08"
+			m["Sep"]="09"; m["Oct"]="10"; m["Nov"]="11"; m["Dec"]="12"
+		}
+		{
+			i = index($0, "xboxaccel")
+			if (i == 0) next
+			rest = substr($0, i)
+			c = index(rest, ":")
+			if (c == 0) next
+			msg = substr(rest, c + 1)
+			sub(/^[[:space:]]+/, "", msg)
+			if (msg == "") next
+			mon = m[$2]
+			if (mon == "") next
+			day = $3 + 0
+			if (day < 10) day = "0" day
+			printf "%s-%s-%s %s\t%s\n", $5, mon, day, $4, msg
+		}
+	' > "$seeded" || { rm -f "$seeded"; return 0; }
+	if [ -s "$LOG" ]; then
+		awk -F '\t' 'NR==FNR { if ($2 != "") seen[$2] = 1; next } !seen[$2]' "$LOG" "$seeded" > "$LOG.merge" || true
+		cat "$LOG" >> "$LOG.merge"
+		mv "$LOG.merge" "$LOG"
+	elif [ -s "$seeded" ]; then
+		mv "$seeded" "$LOG"
+	fi
+	rm -f "$seeded" "$LOG.merge"
 }
 
 uci_get() {
 	uci -q get "xboxaccel.main.$1" 2>/dev/null || true
+}
+
+has_opt() {
+	uci -q show xboxaccel.main 2>/dev/null | grep -q "^xboxaccel.main.$1="
 }
 
 valid_ip() {
@@ -26,6 +84,7 @@ valid_ip() {
 	echo "$1" | awk -F. '{
 		if (NF != 4) exit 1
 		for (i = 1; i <= 4; i++) {
+			if ($i !~ /^[0-9]+$/) exit 1
 			if ($i ~ /^0[0-9]/) exit 1
 			if ($i + 0 > 255) exit 1
 		}
@@ -33,9 +92,19 @@ valid_ip() {
 	}'
 }
 
+public_ipv4() {
+	valid_ip "$1" || return 1
+	case "$1" in
+		0.*|10.*|127.*|169.254.*|192.168.*|255.*) return 1 ;;
+		172.1[6-9].*|172.2[0-9].*|172.3[01].*) return 1 ;;
+		100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|100.12[0-7].*) return 1 ;;
+		22[4-9].*|23[0-9].*|24[0-9].*|25[0-5].*) return 1 ;;
+	esac
+}
+
 valid_host() {
 	echo "$1" | grep -Eq '^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?$' || return 1
-	grep -Fxq -- "$1" "$DOMAINS"
+	awk -F '\t' -v host="$1" '$1 == host { found = 1 } END { exit !found }' "$DOMAINS"
 }
 
 valid_path() {
@@ -66,7 +135,7 @@ setting_mode() {
 setting_interval() {
 	local n
 	n=$(uci_get interval)
-	echo "$n" | grep -Eq '^[0-9]+$' || n=30
+	case "$n" in ''|*[!0-9]*) n=30 ;; esac
 	[ "$n" -lt 5 ] && n=5
 	[ "$n" -gt 1440 ] && n=1440
 	printf '%s\n' "$n"
@@ -75,9 +144,67 @@ setting_interval() {
 setting_margin() {
 	local n
 	n=$(uci_get margin)
-	echo "$n" | grep -Eq '^[0-9]+$' || n=20
+	case "$n" in ''|*[!0-9]*) n=20 ;; esac
 	[ "$n" -gt 90 ] && n=90
 	printf '%s\n' "$n"
+}
+
+setting_mib() {
+	local n
+	n=$(uci_get sample_mib)
+	case "$n" in ''|*[!0-9]*) n=50 ;; esac
+	[ "$n" -lt 8 ] && n=8
+	[ "$n" -gt 100 ] && n=100
+	printf '%s\n' "$n"
+}
+
+setting_carrier() {
+	local carrier
+	carrier=$(uci_get carrier)
+	case "$carrier" in
+		any|telecom|unicom|mobile) printf '%s\n' "$carrier" ;;
+		*) printf '%s\n' any ;;
+	esac
+}
+
+setting_pin() {
+	if [ "$(uci_get pin_global)" = "0" ]; then
+		printf '0\n'
+	else
+		printf '1\n'
+	fi
+}
+
+setting_primary() {
+	local value
+	if has_opt primary_ip; then
+		value=$(uci_get primary_ip)
+	else
+		value=$(uci_get static_ip)
+	fi
+	public_ipv4 "$value" && printf '%s\n' "$value"
+}
+
+setting_legacy() {
+	local value
+	value=$(uci_get legacy_ip)
+	public_ipv4 "$value" && printf '%s\n' "$value"
+}
+
+setting_active_primary() {
+	local value
+	if has_opt active_primary; then
+		value=$(uci_get active_primary)
+	else
+		value=$(uci_get active_ip)
+	fi
+	public_ipv4 "$value" && printf '%s\n' "$value"
+}
+
+setting_active_legacy() {
+	local value
+	value=$(uci_get active_legacy)
+	public_ipv4 "$value" && printf '%s\n' "$value"
 }
 
 sample_host() {
@@ -106,38 +233,46 @@ enabled() {
 	[ "$(uci_get enabled)" = "1" ]
 }
 
-sample_bytes() {
-	local mib
-	mib=$(uci_get sample_mib)
-	echo "$mib" | grep -Eq '^[0-9]+$' || mib=50
-	[ "$mib" -lt 8 ] && mib=8
-	[ "$mib" -gt 100 ] && mib=100
-	echo $((mib * 1048576 - 1))
+migrate_uci() {
+	local dirty=0
+	if ! has_opt primary_ip; then
+		uci set "xboxaccel.main.primary_ip=$(uci_get static_ip)"
+		dirty=1
+	fi
+	if ! has_opt legacy_ip; then
+		uci set xboxaccel.main.legacy_ip=''
+		dirty=1
+	fi
+	if ! has_opt active_primary; then
+		uci set "xboxaccel.main.active_primary=$(uci_get active_ip)"
+		dirty=1
+	fi
+	if ! has_opt active_legacy; then
+		uci set xboxaccel.main.active_legacy=''
+		dirty=1
+	fi
+	if ! has_opt carrier; then
+		uci set xboxaccel.main.carrier='any'
+		dirty=1
+	fi
+	if ! has_opt pin_global; then
+		uci set xboxaccel.main.pin_global='1'
+		dirty=1
+	fi
+	[ "$dirty" = 1 ] && uci commit xboxaccel
 }
 
-write_status() {
-	local running="$1" reason="$2" active="$3" mode="$4" margin="$5" first=1 en=0
-	local tmp ip http bps ms ok bytes group host loc loc_json
-	enabled && en=1
-	tmp=$(mktemp)
-	{
-		printf '{"running":%s,"enabled":%s,"time":%s,"mode":"%s","active":"%s","reason":"%s","margin":%s,"results":[' \
-			"$running" "$en" "$(date +%s)" "$mode" "$active" "$reason" "$margin"
-		if [ -f "$RESULTS" ]; then
-			while IFS="$(printf '\t')" read -r ip http bps ms ok bytes group host loc; do
-				[ -n "$ip" ] || continue
-				[ "$first" = 1 ] || printf ','
-				first=0
-				loc_json=$(printf '%s' "$loc" | awk 'BEGIN { ORS = "" } { gsub(/\\/, "\\\\"); gsub(/"/, "\\\""); print }')
-				printf '{"ip":"%s","http":%s,"bps":%s,"conn_ms":%s,"ok":%s,"bytes":%s,"group":"%s","host":"%s","loc":"%s"}' \
-					"$ip" "${http:-0}" "${bps:-0}" "${ms:-0}" "${ok:-0}" "${bytes:-0}" \
-					"${group:-manual}" "${host:-}" "$loc_json"
-			done < "$RESULTS"
-		fi
-		printf ']}\n'
-	} > "$tmp"
-	mv "$tmp" "$STATUS"
-	chmod 644 "$STATUS"
+bump_gen() {
+	local n
+	n=$(cat "$GEN" 2>/dev/null || echo 0)
+	case "$n" in ''|*[!0-9]*) n=0 ;; esac
+	echo $((n + 1)) > "$GEN"
+}
+
+stale() {
+	local now
+	now=$(cat "$GEN" 2>/dev/null || echo 0)
+	[ "$now" != "$gen0" ]
 }
 
 install_cron() {
@@ -160,51 +295,122 @@ remove_cron() {
 	/etc/init.d/cron restart >/dev/null 2>&1 || true
 }
 
-restart_dns() {
-	if ! /etc/init.d/dnsmasq restart >/tmp/xboxaccel.dns.log 2>&1; then
-		log "dnsmasq restart failed"
-		return 1
-	fi
-	local i=0
-	while [ "$i" -lt 20 ]; do
-		if netstat -lntup 2>/dev/null | grep ':53 ' | grep -q dnsmasq; then
-			return 0
-		fi
+dns_lookup() {
+	local pid i=0
+	nslookup -type="$1" "$2" 127.0.0.1 >/tmp/xboxaccel.lookup 2>&1 &
+	pid=$!
+	while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 3 ]; do
+		sleep 1
 		i=$((i + 1))
+	done
+	kill "$pid" 2>/dev/null
+	wait "$pid" 2>/dev/null
+}
+
+dns_up() {
+	dns_lookup a localhost
+	grep -q '[Aa]ddress' /tmp/xboxaccel.lookup
+}
+
+answer_matches() {
+	local host="$1" ip="$2" try=0
+	# dnsmasq answers only after the restart has finished listening.
+	while [ "$try" -lt 8 ]; do
+		dns_lookup a "$host"
+		if grep -F "$ip" /tmp/xboxaccel.lookup >/dev/null; then
+			dns_lookup aaaa "$host"
+			if awk '
+				$1 ~ /^Address:?$/ {
+					v = $2
+					if (v ~ /^127\./) next
+					if (index(v, ":") && v !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/) exit 1
+				}
+			' /tmp/xboxaccel.lookup; then
+				return 0
+			fi
+		fi
+		try=$((try + 1))
 		sleep 1
 	done
-	log "dnsmasq did not resume listening on port 53"
+	cat /tmp/xboxaccel.lookup >> /tmp/xboxaccel.dns.log 2>/dev/null || true
+	log "解析没有对上 $host，期望 $ip"
 	return 1
 }
 
-publish_ip() {
-	local ip="$1" dir dest tmp changed=0 domain
-	dir=$(confdir)
-	mkdir -p "$dir"
-	dest="$dir/$CONF_NAME"
-	tmp=$(mktemp)
-	echo '# generated by xboxaccel' > "$tmp"
-	while read -r domain; do
-		case "$domain" in
+verify_published() {
+	local dest="$1" pairs ip host fail=0
+	pairs=$(mktemp) || return 1
+	awk -F/ '/^address=\// { print $3 "\t" $2 }' "$dest" | awk -F '\t' '!seen[$1]++' > "$pairs"
+	if [ ! -s "$pairs" ]; then
+		rm -f "$pairs"
+		dns_up
+		return $?
+	fi
+	while IFS="$(printf '\t')" read -r ip host; do
+		answer_matches "$host" "$ip" || fail=1
+	done < "$pairs"
+	rm -f "$pairs"
+	[ "$fail" = 0 ]
+}
+
+render_dns() {
+	local primary="$1" legacy="$2" pin="$3" dest="$4" host pool edge ip
+	: > "$dest"
+	echo '# generated by xboxaccel' >> "$dest"
+	while IFS="$(printf '\t')" read -r host pool edge extra; do
+		case "$host" in
 			''|'#'*) continue ;;
 		esac
-		echo "address=/${domain}/${ip}" >> "$tmp"
+		case "$pool" in
+			primary) ip=$primary ;;
+			legacy) ip=$legacy ;;
+			*) continue ;;
+		esac
+		public_ipv4 "$ip" || continue
+		case "$edge" in
+			global) [ "$pin" = 1 ] || continue ;;
+			cn|'') ;;
+			*) continue ;;
+		esac
+		printf 'local=/%s/\n' "$host" >> "$dest"
+		printf 'address=/%s/%s\n' "$host" "$ip" >> "$dest"
 	done < "$DOMAINS"
+}
+
+publish() {
+	local primary="$1" legacy="$2" dir dest tmp
+	dir=$(confdir)
+	mkdir -p "$dir" || return 1
+	dest="$dir/$CONF_NAME"
+	rm -f "$dir/xboxaccel.conf.bak" "$dir/xboxaccel.conf.mark" "$dir/xboxaccel.conf.retract"
+	tmp=$(mktemp) || return 1
+	render_dns "$primary" "$legacy" "$(setting_pin)" "$tmp"
 	if [ -f "$dest" ] && cmp -s "$tmp" "$dest"; then
 		rm -f "$tmp"
+		return 0
+	fi
+	# Backups must stay outside conf-dir. dnsmasq reads every file there.
+	if [ -f "$dest" ]; then
+		cp -f "$dest" /tmp/xboxaccel.conf.bak || { rm -f "$tmp"; return 1; }
+		rm -f /tmp/xboxaccel.mark
 	else
-		mv "$tmp" "$dest"
-		chmod 644 "$dest"
-		changed=1
+		: > /tmp/xboxaccel.conf.bak
+		echo absent > /tmp/xboxaccel.mark
 	fi
-	cur=$(uci_get active_ip)
-	if [ "$cur" != "$ip" ]; then
-		uci set "xboxaccel.main.active_ip=$ip"
-		uci commit xboxaccel
+	mv "$tmp" "$dest" || return 1
+	chmod 644 "$dest"
+	if /etc/init.d/dnsmasq restart >/tmp/xboxaccel.dns.log 2>&1 && verify_published "$dest"; then
+		rm -f /tmp/xboxaccel.conf.bak /tmp/xboxaccel.mark
+		return 0
 	fi
-	if [ "$changed" = 1 ]; then
-		restart_dns
+	if [ -f /tmp/xboxaccel.mark ]; then
+		rm -f "$dest" /tmp/xboxaccel.mark /tmp/xboxaccel.conf.bak
+	else
+		mv -f /tmp/xboxaccel.conf.bak "$dest"
 	fi
+	/etc/init.d/dnsmasq restart >/tmp/xboxaccel.dns.log 2>&1 || true
+	log "dnsmasq 没有接受新记录，已退回上一份"
+	return 1
 }
 
 retract() {
@@ -212,19 +418,27 @@ retract() {
 	dir=$(confdir)
 	dest="$dir/$CONF_NAME"
 	[ -f "$dest" ] || return 0
-	rm -f "$dest"
-	restart_dns
+	mv "$dest" /tmp/xboxaccel.conf.retract || return 1
+	if /etc/init.d/dnsmasq restart >/tmp/xboxaccel.dns.log 2>&1 && dns_up; then
+		rm -f /tmp/xboxaccel.conf.retract
+		return 0
+	fi
+	mv /tmp/xboxaccel.conf.retract "$dest"
+	/etc/init.d/dnsmasq restart >/tmp/xboxaccel.dns.log 2>&1 || true
+	log "撤回后 dnsmasq 没有恢复，已放回上一份"
+	return 1
 }
 
 list_candidates() {
 	uci -q show xboxaccel 2>/dev/null | awk -F= '
 		/^xboxaccel\.[^.]+=candidate$/ {
-			if (sec != "") print ip "\t" en "\t" name
+			if (sec != "") print ip "\t" en "\t" name "\t" pool
 			split($1, a, ".")
 			sec = a[2]
 			ip = ""
 			en = "1"
 			name = ""
+			pool = "primary"
 			next
 		}
 		{
@@ -235,16 +449,21 @@ list_candidates() {
 			if (a[3] == "ip") ip = val
 			else if (a[3] == "enabled") en = val
 			else if (a[3] == "name") name = val
+			else if (a[3] == "pool") pool = val
 		}
-		END { if (sec != "") print ip "\t" en "\t" name }
+		END { if (sec != "") print ip "\t" en "\t" name "\t" pool }
 	'
 }
 
-list_targets() {
-	local skip catalog ip loc host group en name
-	skip=$(mktemp)
-	catalog=$(mktemp)
-	list_candidates | while IFS="$(printf '\t')" read -r ip en name; do
+catalog_has() {
+	awk -F '\t' -v ip="$1" '$1 == ip { found = 1 } END { exit !found }' "$CATALOG"
+}
+
+build_catalog() {
+	local skip ip loc host group en name pool
+	skip=$(mktemp) || return 1
+	: > "$CATALOG"
+	list_candidates | while IFS="$(printf '\t')" read -r ip en name pool; do
 		[ "$en" = "0" ] && printf '%s\n' "$ip"
 	done > "$skip"
 	if [ -f "$NODES" ]; then
@@ -252,30 +471,49 @@ list_targets() {
 			case "$ip" in
 				''|'#'*) continue ;;
 			esac
-			valid_ip "$ip" || continue
-			printf '%s\n' "$ip" >> "$catalog"
+			public_ipv4 "$ip" || continue
 			en=1
 			grep -qxF -- "$ip" "$skip" && en=0
-			printf '%s\t%s\t%s\t%s\t%s\n' "$ip" "$loc" "$host" "$group" "$en"
+			printf '%s\t%s\t%s\t%s\t%s\n' "$ip" "$loc" "$host" "$group" "$en" >> "$CATALOG"
 		done < "$NODES"
 	fi
-	list_candidates | while IFS="$(printf '\t')" read -r ip en name; do
+	list_candidates | while IFS="$(printf '\t')" read -r ip en name pool; do
 		[ "$en" = "0" ] && continue
-		valid_ip "$ip" || continue
-		grep -qxF -- "$ip" "$catalog" && continue
-		printf '%s\t%s\t%s\t%s\t%s\n' "$ip" "$name" "$(sample_host)" "manual" "1"
+		public_ipv4 "$ip" || continue
+		catalog_has "$ip" && continue
+		case "$pool" in
+			legacy) group=manual-legacy ;;
+			*) group=manual-primary ;;
+		esac
+		printf '%s\t%s\t%s\t%s\t1\n' "$ip" "${name:-手动}" "$(sample_host)" "$group" >> "$CATALOG"
 	done
-	rm -f "$skip" "$catalog"
+	rm -f "$skip"
+}
+
+collect_parts() {
+	local f
+	: > "$RESULTS"
+	[ -d "$PARTS" ] || return 0
+	for f in "$PARTS"/*; do
+		[ -f "$f" ] || continue
+		cat "$f" >> "$RESULTS"
+	done
 }
 
 probe_one() {
-	local ip="$1" host="$2" path="$3" loc="$4" group="$5" end="$6"
+	local ip="$1" host="$2" path="$3" loc="$4" group="$5" limit="$6" maxtime="$7"
 	local line rc http bps conn bytes bps_i ms ok
-	line=$(curl -sS -o /dev/null --http1.1 --range "0-${end}" --max-time 15 --connect-timeout 4 \
+	mkdir -p "$PARTS"
+	curl -4 -sS -o /dev/null --http1.1 --noproxy '*' --max-filesize "$limit" \
+		--range "0-$((limit - 1))" --connect-timeout 3 --max-time "$maxtime" \
 		--resolve "${host}:80:${ip}" \
 		-w '%{http_code} %{speed_download} %{time_connect} %{size_download}' \
-		"http://${host}${path}" 2>/dev/null)
+		"http://${host}${path}" > "$PARTS/$ip.curlout" 2>/dev/null &
+	echo $! > "$PARTS/$ip.curl"
+	wait $!
 	rc=$?
+	line=$(cat "$PARTS/$ip.curlout" 2>/dev/null)
+	rm -f "$PARTS/$ip.curl" "$PARTS/$ip.curlout"
 	set -- $line
 	http=${1:-000}
 	bps=${2:-0}
@@ -300,244 +538,789 @@ probe_one() {
 	mv "$PARTS/$ip.new" "$PARTS/$ip"
 }
 
-collect_parts() {
-	local f
-	: > "$RESULTS"
+stop_probes() {
+	local f pid
 	[ -d "$PARTS" ] || return 0
-	for f in "$PARTS"/*; do
+	for f in "$PARTS"/*.curl; do
 		[ -f "$f" ] || continue
-		cat "$f" >> "$RESULTS"
+		pid=$(cat "$f" 2>/dev/null)
+		kill "$pid" 2>/dev/null
 	done
+	[ -n "$BATCH" ] && kill $BATCH 2>/dev/null
+	[ -n "$BATCH" ] && wait $BATCH 2>/dev/null
+	BATCH=
+}
+
+wait_batch() {
+	local pid alive
+	[ -n "$BATCH" ] || return 0
+	while :; do
+		if stale; then
+			stop_probes
+			return 1
+		fi
+		alive=0
+		for pid in $BATCH; do
+			if kill -0 "$pid" 2>/dev/null; then
+				alive=1
+			fi
+		done
+		[ "$alive" = 1 ] || break
+		sleep 1
+	done
+	wait $BATCH 2>/dev/null
+	BATCH=
+	if stale; then
+		stop_probes
+		return 1
+	fi
+	return 0
 }
 
 run_probes() {
-	local path ip loc nodehost group en n=0 end
-	end=$(sample_bytes)
+	local ip loc host group en n=0 limit maxtime path
 	path=$(sample_path)
+	if [ "$SWEEP" = routine ]; then
+		limit=$((8 * 1048576))
+		maxtime=12
+		SAMPLE_MIB=8
+		CAP=10
+	else
+		limit=$(setting_mib)
+		SAMPLE_MIB=$limit
+		limit=$((limit * 1048576))
+		maxtime=18
+		CAP=24
+	fi
 	rm -rf "$PARTS"
 	mkdir -p "$PARTS"
 	: > "$RESULTS"
-	while IFS="$(printf '\t')" read -r ip loc nodehost group en; do
-		[ "$en" = "0" ] && continue
-		valid_ip "$ip" || continue
-		probe_one "$ip" "$nodehost" "$path" "$loc" "$group" "$end" &
+	while IFS="$(printf '\t')" read -r ip loc host group en; do
+		if stale; then
+			return 1
+		fi
+		[ "$en" = "1" ] || continue
+		public_ipv4 "$ip" || continue
+		valid_host "$host" || continue
+		probe_one "$ip" "$host" "$path" "$loc" "$group" "$limit" "$maxtime" &
+		BATCH="$BATCH $!"
 		n=$((n + 1))
-		if [ "$n" -ge 4 ]; then
-			wait
+		if [ "$n" -ge 6 ]; then
+			wait_batch || return 1
 			n=0
 			collect_parts
-			if [ "$(setting_mode)" = "static" ] && enabled; then
-				write_status 1 running "$(uci_get static_ip)" static "$(setting_margin)"
-			else
-				write_status 1 running "$(uci_get active_ip)" "$(setting_mode)" "$(setting_margin)"
-			fi
+			write_running
 		fi
-	done << EOF
-$(list_targets)
-EOF
-	wait
+	done < "$ROSTER_OUT"
+	wait_batch || return 1
 	collect_parts
 }
 
-decide() {
-	local active="$1" margin="$2" best_ip="" best_bps=0 cur_ok=0 cur_bps=0
-	local ip http bps ms ok bytes group host loc
-	[ -s "$RESULTS" ] || {
-		printf '\t%s\n' no-candidate
-		return
-	}
-	while IFS="$(printf '\t')" read -r ip http bps ms ok bytes group host loc; do
-		[ "$ok" = "1" ] || continue
-		case "$group" in
-			cn1|manual) ;;
-			*) continue ;;
-		esac
-		if [ -z "$best_ip" ] || [ "$bps" -gt "$best_bps" ]; then
-			best_ip=$ip
-			best_bps=$bps
-		fi
-		if [ "$ip" = "$active" ]; then
-			cur_ok=1
-			cur_bps=$bps
-		fi
-	done < "$RESULTS"
-	if [ -z "$best_ip" ]; then
-		printf '\t%s\n' no-healthy
-		return
-	fi
-	if [ -z "$active" ] || [ "$cur_ok" != "1" ]; then
-		if [ -n "$active" ] && [ "$cur_ok" != "1" ]; then
-			printf '%s\t%s\n' "$best_ip" current-dead
-		else
-			printf '%s\t%s\n' "$best_ip" selected
-		fi
-		return
-	fi
-	if [ "$best_ip" = "$active" ]; then
-		printf '%s\t%s\n' "$active" kept
-		return
-	fi
-	if awk -v b="$best_bps" -v c="$cur_bps" -v m="$margin" 'BEGIN { exit !(b > c * (100 + m) / 100) }'; then
-		printf '%s\t%s\n' "$best_ip" switched
+keep_on_miss() {
+	local pool="$1"
+	[ -n "$2" ] || return 1
+	[ -s "$RESULTS" ] || return 1
+	awk -F '\t' -v pool="$pool" '
+		function want(group) {
+			if (pool == "primary") return group == "cn1" || group == "manual-primary"
+			return group == "cn2" || group == "manual-legacy"
+		}
+		want($7) {
+			seen++
+			if ($2 != 404) other = 1
+		}
+		END { exit !(seen && !other) }
+	' "$RESULTS"
+}
+
+summary_reason() {
+	local primary="$1" legacy="$2"
+	case "$primary" in switched) printf '%s\n' switched; return ;; esac
+	case "$legacy" in switched) printf '%s\n' switched; return ;; esac
+	case "$primary" in current-dead) printf '%s\n' current-dead; return ;; esac
+	case "$legacy" in current-dead) printf '%s\n' current-dead; return ;; esac
+	case "$primary" in selected) printf '%s\n' selected; return ;; esac
+	case "$legacy" in selected) printf '%s\n' selected; return ;; esac
+	case "$primary:$legacy" in
+		no-healthy:no-healthy|no-candidate:no-candidate|no-healthy:no-candidate|no-candidate:no-healthy)
+			printf '%s\n' "$primary"
+			return
+			;;
+	esac
+	printf '%s\n' kept
+}
+
+set_if_changed() {
+	local key="$1" value="$2" cur
+	cur=$(uci_get "$key")
+	[ "$cur" = "$value" ] && return 0
+	uci set "xboxaccel.main.$key=$value"
+	DIRTY=1
+}
+
+write_status() {
+	local running="$1" tmp ip http bps ms ok bytes group host loc finished=0
+	[ -f "$RESULTS" ] && finished=$(awk 'END { print NR + 0 }' "$RESULTS")
+	. /usr/share/libubox/jshn.sh
+	json_init
+	json_add_int running "$running"
+	if enabled; then
+		json_add_int enabled 1
 	else
-		printf '%s\t%s\n' "$active" kept
+		json_add_int enabled 0
 	fi
+	json_add_int time "$(date +%s)"
+	json_add_string mode "$(setting_mode)"
+	json_add_string reason "${OVERALL:-idle}"
+	json_add_int margin "$(setting_margin)"
+	json_add_string carrier "${CARRIER:-$(setting_carrier)}"
+	json_add_string sweep "${SWEEP:-}"
+	json_add_string probe_ip "${PROBE_IP:-}"
+	json_add_int probe_bytes "${PROBE_BYTES:-0}"
+	json_add_int probe_bps "${PROBE_BPS:-0}"
+	json_add_int probe_limit "${PROBE_LIMIT:-0}"
+	json_add_int pin_global "$(setting_pin)"
+	json_add_string primary_ip "${PRIMARY:-}"
+	json_add_string legacy_ip "${LEGACY:-}"
+	json_add_string primary_reason "${PRIMARY_REASON:-}"
+	json_add_string legacy_reason "${LEGACY_REASON:-}"
+	json_add_string active "${PRIMARY:-}"
+	json_add_int planned "${PLANNED:-0}"
+	json_add_int finished "$finished"
+	json_add_int sample_mib "${SAMPLE_MIB:-$(setting_mib)}"
+	json_add_int cap "${CAP:-0}"
+	json_add_array results
+	if [ -f "$RESULTS" ]; then
+		while IFS="$(printf '\t')" read -r ip http bps ms ok bytes group host loc; do
+			[ -n "$ip" ] || continue
+			json_add_object ""
+			json_add_string ip "$ip"
+			json_add_int http "${http:-0}"
+			json_add_int bps "${bps:-0}"
+			json_add_int conn_ms "${ms:-0}"
+			json_add_int ok "${ok:-0}"
+			json_add_int bytes "${bytes:-0}"
+			json_add_string group "${group:-manual-primary}"
+			json_add_string host "${host:-}"
+			json_add_string loc "${loc:-}"
+			json_close_object
+		done < "$RESULTS"
+	fi
+	json_close_array
+	tmp=$(mktemp) || return 1
+	json_dump > "$tmp"
+	mv "$tmp" "$STATUS"
+	chmod 644 "$STATUS"
+}
+
+note_stopped() {
+	collect_parts
+	rm -f "$ROSTER_OUT"
+	if [ "$(setting_mode)" = static ]; then
+		load_static_view
+	else
+		PRIMARY=$(setting_active_primary)
+		LEGACY=$(setting_active_legacy)
+		PRIMARY_REASON=kept
+		LEGACY_REASON=kept
+		OVERALL=kept
+	fi
+	if [ -f "$STOP" ]; then
+		rm -f "$STOP"
+		OVERALL=stopped
+		date +%s > "$LAST"
+		log "测速已停止"
+	else
+		log "这轮测速被新操作打断"
+	fi
+	write_status 0
+}
+
+write_running() {
+	OVERALL=running
+	PRIMARY_REASON=running
+	LEGACY_REASON=running
+	if [ "$(setting_mode)" = static ]; then
+		PRIMARY=$(setting_primary)
+		LEGACY=$(setting_legacy)
+	else
+		PRIMARY=$(setting_active_primary)
+		LEGACY=$(setting_active_legacy)
+	fi
+	write_status 1
+}
+
+take_decision() {
+	local pool="$1" current="$2" margin="$3" decision ip reason
+	decision=$("$POLICY" decide "$pool" "$current" "$margin" < "$RESULTS")
+	ip=$(printf '%s\n' "$decision" | awk -F '\t' 'NR==1 { print $1 }')
+	reason=$(printf '%s\n' "$decision" | awk -F '\t' 'NR==1 { print $2 }')
+	if [ "$reason" = no-healthy ] && keep_on_miss "$pool" "$current"; then
+		ip=$current
+		reason=sample-miss
+	fi
+	case "$reason" in
+		no-healthy|no-candidate) ip= ;;
+	esac
+	public_ipv4 "$ip" || ip=
+	printf '%s\t%s\n' "$ip" "$reason"
+}
+
+finish_test() {
+	local mode margin cur_p cur_l picked reason_p reason_l new_p new_l
+	mode=$(setting_mode)
+	margin=$(setting_margin)
+	if [ "$mode" = static ]; then
+		PRIMARY=$(setting_primary)
+		LEGACY=$(setting_legacy)
+		PRIMARY_REASON=static
+		LEGACY_REASON=static
+		OVERALL=static
+		write_status 0
+		date +%s > "$LAST"
+		log "测速结束，静态地址未改 主=${PRIMARY:-无} 旧=${LEGACY:-无}"
+		return 0
+	fi
+	cur_p=$(setting_active_primary)
+	cur_l=$(setting_active_legacy)
+	picked=$(take_decision primary "$cur_p" "$margin")
+	new_p=$(printf '%s\n' "$picked" | awk -F '\t' 'NR==1 { print $1 }')
+	reason_p=$(printf '%s\n' "$picked" | awk -F '\t' 'NR==1 { print $2 }')
+	picked=$(take_decision legacy "$cur_l" "$margin")
+	new_l=$(printf '%s\n' "$picked" | awk -F '\t' 'NR==1 { print $1 }')
+	reason_l=$(printf '%s\n' "$picked" | awk -F '\t' 'NR==1 { print $2 }')
+	if stale; then
+		note_stopped
+		return 0
+	fi
+	if enabled; then
+		if ! publish "$new_p" "$new_l"; then
+			PRIMARY=$cur_p
+			LEGACY=$cur_l
+			PRIMARY_REASON=dns-failed
+			LEGACY_REASON=dns-failed
+			OVERALL=dns-failed
+			write_status 0
+			return 1
+		fi
+	fi
+	if stale; then
+		PRIMARY=$new_p
+		LEGACY=$new_l
+		PRIMARY_REASON=$reason_p
+		LEGACY_REASON=$reason_l
+		OVERALL=$(summary_reason "$reason_p" "$reason_l")
+		if [ -f "$STOP" ]; then
+			rm -f "$STOP"
+			OVERALL=stopped
+			log "测速已停止"
+		else
+			log "这轮测速被新操作打断"
+		fi
+		write_status 0
+		return 0
+	fi
+	DIRTY=0
+	set_if_changed active_primary "$new_p"
+	set_if_changed active_legacy "$new_l"
+	set_if_changed active_ip "$new_p"
+	[ "$DIRTY" = 1 ] && uci commit xboxaccel
+	PRIMARY=$new_p
+	LEGACY=$new_l
+	PRIMARY_REASON=$reason_p
+	LEGACY_REASON=$reason_l
+	OVERALL=$(summary_reason "$reason_p" "$reason_l")
+	write_status 0
+	date +%s > "$LAST"
+	log "测速结束 $OVERALL 主=${new_p:-无}($reason_p) 旧=${new_l:-无}($reason_l)"
 }
 
 cmd_test() {
-	local mode margin active decision new_ip reason
+	local sweep="$1" carrier="$2"
+	case "$sweep" in
+		routine|thorough) ;;
+		*) sweep=thorough ;;
+	esac
+	case "$carrier" in
+		any|telecom|unicom|mobile) ;;
+		*) carrier=$(setting_carrier) ;;
+	esac
+	exec 9>"$LOCK"
+	flock -n 9 || {
+		echo busy
+		log "已有一轮测速在进行"
+		exit 0
+	}
+	rm -f "$STOP"
+	gen0=$(cat "$GEN" 2>/dev/null || echo 0)
+	PROBE_IP=
+	SWEEP=$sweep
+	CARRIER=$carrier
+	migrate_uci
+	if [ -s "$RESULTS" ]; then
+		cp -f "$RESULTS" "$HISTORY"
+	fi
+	[ -f "$HISTORY" ] || : > "$HISTORY"
+	build_catalog
+	ROSTER_OUT=$(mktemp) || return 1
+	"$ROSTER" "$SWEEP" "$CARRIER" "$(setting_active_primary)" "$(setting_active_legacy)" "$HISTORY" < "$CATALOG" > "$ROSTER_OUT"
+	PLANNED=$(awk 'END { print NR + 0 }' "$ROSTER_OUT")
+	if [ "$SWEEP" = routine ]; then
+		SAMPLE_MIB=8
+		CAP=10
+	else
+		SAMPLE_MIB=$(setting_mib)
+		CAP=24
+	fi
+	write_running
+	if [ "$SWEEP" = routine ]; then
+		log "开始快速测速，计划 ${PLANNED} 个地址"
+	else
+		log "开始完整测速，计划 ${PLANNED} 个地址"
+	fi
+	if ! run_probes || stale; then
+		note_stopped
+		return 0
+	fi
+	finish_test
+	rm -f "$ROSTER_OUT"
+}
+
+cmd_tick() {
+	local interval now last elapsed need
+	enabled || exit 0
+	[ "$(setting_mode)" = dynamic ] || exit 0
+	interval=$(setting_interval)
+	now=$(date +%s)
+	last=0
+	[ -f "$LAST" ] && last=$(cat "$LAST" 2>/dev/null || echo 0)
+	case "$last" in ''|*[!0-9]*) last=0 ;; esac
+	elapsed=$((now - last))
+	need=$((interval * 60))
+	[ "$elapsed" -lt "$need" ] && exit 0
+	cmd_test routine "$(setting_carrier)"
+}
+
+load_static_view() {
+	PRIMARY=$(setting_primary)
+	LEGACY=$(setting_legacy)
+	PRIMARY_REASON=static
+	LEGACY_REASON=static
+	OVERALL=static
+	if ! public_ipv4 "$PRIMARY" && ! public_ipv4 "$LEGACY"; then
+		OVERALL=missing-ip
+	fi
+}
+
+cmd_apply() {
+	local mode
+	bump_gen
+	exec 9>"$LOCK"
+	flock 9
+	migrate_uci
+	mode=$(setting_mode)
+	SWEEP=
+	if ! enabled; then
+		retract || true
+		remove_cron
+		PRIMARY=$(setting_primary)
+		LEGACY=$(setting_legacy)
+		PRIMARY_REASON=disabled
+		LEGACY_REASON=disabled
+		OVERALL=disabled
+		write_status 0
+		log "服务已停用，记录已撤回"
+		return 0
+	fi
+	if [ "$mode" = static ]; then
+		remove_cron
+		load_static_view
+		if ! publish "$PRIMARY" "$LEGACY"; then
+			PRIMARY_REASON=dns-failed
+			LEGACY_REASON=dns-failed
+			OVERALL=dns-failed
+			write_status 0
+			return 1
+		fi
+		write_status 0
+		log "静态记录已生效 主=${PRIMARY:-无} 旧=${LEGACY:-无}"
+		return 0
+	fi
+	install_cron
+	PRIMARY=$(setting_active_primary)
+	LEGACY=$(setting_active_legacy)
+	if public_ipv4 "$PRIMARY" || public_ipv4 "$LEGACY"; then
+		PRIMARY_REASON=kept
+		LEGACY_REASON=kept
+		OVERALL=kept
+		if ! publish "$PRIMARY" "$LEGACY"; then
+			PRIMARY_REASON=dns-failed
+			LEGACY_REASON=dns-failed
+			OVERALL=dns-failed
+			write_status 0
+			return 1
+		fi
+		write_status 0
+		log "动态记录已生效 主=${PRIMARY:-无} 旧=${LEGACY:-无}"
+		return 0
+	fi
+	retract || true
+	PRIMARY_REASON=running
+	LEGACY_REASON=running
+	OVERALL=running
+	PLANNED=0
+	write_status 1
+	log "动态模式还没有地址，已开始测速"
+	flock -u 9
+	/usr/sbin/xboxaccel test-bg routine "$(setting_carrier)"
+}
+
+cmd_use() {
+	local pool="$1" ip="$2"
+	case "$pool" in
+		primary|legacy) ;;
+		*)
+			echo "线路必须是 primary 或 legacy" >&2
+			exit 1
+			;;
+	esac
+	public_ipv4 "$ip" || {
+		echo "这个地址不是公网 IPv4" >&2
+		exit 1
+	}
+	bump_gen
+	exec 9>"$LOCK"
+	flock 9
+	migrate_uci
+	uci set xboxaccel.main.mode='static'
+	uci set xboxaccel.main.enabled='1'
+	if [ "$pool" = primary ]; then
+		uci set "xboxaccel.main.primary_ip=$ip"
+		uci set "xboxaccel.main.active_primary=$ip"
+		uci set "xboxaccel.main.static_ip=$ip"
+		uci set "xboxaccel.main.active_ip=$ip"
+	else
+		uci set "xboxaccel.main.legacy_ip=$ip"
+		uci set "xboxaccel.main.active_legacy=$ip"
+	fi
+	uci commit xboxaccel
+	remove_cron
+	load_static_view
+	if ! publish "$PRIMARY" "$LEGACY"; then
+		PRIMARY_REASON=dns-failed
+		LEGACY_REASON=dns-failed
+		OVERALL=dns-failed
+		write_status 0
+		exit 1
+	fi
+	write_status 0
+	if [ "$pool" = legacy ]; then
+		log "已改用静态旧下载 $ip"
+	else
+		log "已改用静态主下载 $ip"
+	fi
+}
+
+publish_probe() {
+	local running="$1"
+	restore_view
+	SWEEP=once
+	SAMPLE_MIB=8
+	PLANNED=0
+	CAP=1
+	if [ "$running" = 1 ]; then
+		OVERALL=running
+	fi
+	write_status "$running"
+}
+
+probe_watch() {
+	local ip="$1" host="$2" path="$3" loc="$4" group="$5" limit="$6" maxtime="$7"
+	local cpid rc line http bps conn bytes bps_i ms ok cur start_cs now_cs elapsed
+	mkdir -p "$PARTS"
+	rm -f "$PARTS/$ip.body" "$PARTS/$ip.curl" "$PARTS/$ip.curlout"
+	: > "$PARTS/$ip.body"
+	curl -4 -sS -o "$PARTS/$ip.body" --http1.1 --noproxy '*' --max-filesize "$limit" \
+		--range "0-$((limit - 1))" --connect-timeout 3 --max-time "$maxtime" \
+		--resolve "${host}:80:${ip}" \
+		-w '%{http_code} %{speed_download} %{time_connect} %{size_download}' \
+		"http://${host}${path}" > "$PARTS/$ip.curlout" 2>/dev/null &
+	cpid=$!
+	echo "$cpid" > "$PARTS/$ip.curl"
+	start_cs=$(awk '{ printf "%d", $1 * 100 }' /proc/uptime)
+	while kill -0 "$cpid" 2>/dev/null; do
+		if stale; then
+			kill "$cpid" 2>/dev/null
+			break
+		fi
+		cur=0
+		if [ -f "$PARTS/$ip.body" ]; then
+			cur=$(wc -c < "$PARTS/$ip.body" | awk '{ print $1 + 0 }')
+		fi
+		now_cs=$(awk '{ printf "%d", $1 * 100 }' /proc/uptime)
+		elapsed=$((now_cs - start_cs))
+		PROBE_BYTES=$cur
+		PROBE_LIMIT=$limit
+		if [ "$elapsed" -gt 0 ] && [ "$cur" -gt 0 ]; then
+			PROBE_BPS=$((cur * 100 / elapsed))
+		fi
+		publish_probe 1
+		python3 -c 'import time; time.sleep(0.1)' 2>/dev/null || sleep 1
+	done
+	wait "$cpid"
+	rc=$?
+	line=$(cat "$PARTS/$ip.curlout" 2>/dev/null)
+	rm -f "$PARTS/$ip.curl" "$PARTS/$ip.curlout" "$PARTS/$ip.body"
+	set -- $line
+	http=${1:-000}
+	bps=${2:-0}
+	conn=${3:-0}
+	bytes=${4:-0}
+	if [ "$rc" -ne 0 ] && [ "$rc" -ne 28 ]; then
+		http=000
+		bps=0
+		bytes=0
+	fi
+	http=$(awk -v s="$http" 'BEGIN { printf "%d", s + 0 }')
+	bps_i=$(awk -v s="$bps" 'BEGIN { printf "%d", s + 0 }')
+	ms=$(awk -v s="$conn" 'BEGIN { printf "%d", (s + 0) * 1000 }')
+	bytes=$(awk -v s="$bytes" 'BEGIN { printf "%d", s + 0 }')
+	ok=0
+	case "$http" in
+		200|206) [ "$bytes" -ge 1048576 ] && ok=1 ;;
+	esac
+	PROBE_BYTES=$bytes
+	PROBE_BPS=$bps_i
+	PROBE_LIMIT=$limit
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$ip" "$http" "$bps_i" "$ms" "$ok" "$bytes" "$group" "$host" "$loc" > "$PARTS/$ip"
+}
+
+merge_one() {
+	local file="$1" ip
+	[ -f "$file" ] || return 0
+	ip=$(awk -F '\t' 'NR==1 { print $1; exit }' "$file")
+	[ -n "$ip" ] || return 0
+	[ -f "$RESULTS" ] || : > "$RESULTS"
+	awk -F '\t' -v ip="$ip" '$1 != ip && $1 != ""' "$RESULTS" > "$RESULTS.one"
+	cat "$file" >> "$RESULTS.one"
+	mv "$RESULTS.one" "$RESULTS"
+}
+
+restore_view() {
+	if [ "$(setting_mode)" = static ]; then
+		load_static_view
+	else
+		PRIMARY=$(setting_active_primary)
+		LEGACY=$(setting_active_legacy)
+		PRIMARY_REASON=kept
+		LEGACY_REASON=kept
+		OVERALL=kept
+	fi
+}
+
+cmd_probe() {
+	local ip="$1" loc host group limit
+	public_ipv4 "$ip" || {
+		echo "这个地址不是公网 IPv4" >&2
+		exit 1
+	}
 	exec 9>"$LOCK"
 	flock -n 9 || {
 		echo busy
 		exit 0
 	}
-	mode=$(setting_mode)
-	margin=$(setting_margin)
-	active=$(uci_get active_ip)
-	: > "$RESULTS"
-	write_status 1 running "$active" "$mode" "$margin"
-	run_probes
-	mode=$(setting_mode)
-	if [ "$mode" = "static" ] && enabled; then
-		active=$(uci_get static_ip)
-		write_status 0 static "$active" static "$(setting_margin)"
-		date +%s > "$LAST"
-		log "test kept static active=${active:-none}"
-		return 0
+	rm -f "$STOP"
+	gen0=$(cat "$GEN" 2>/dev/null || echo 0)
+	restore_view
+	SWEEP=once
+	PROBE_IP=$ip
+	PROBE_BYTES=0
+	PROBE_BPS=0
+	PLANNED=0
+	CAP=1
+	SAMPLE_MIB=8
+	CARRIER=$(setting_carrier)
+	limit=$((8 * 1048576))
+	PROBE_LIMIT=$limit
+	OVERALL=running
+	write_status 1
+	log "开始单点测速 $ip"
+	loc=$(awk -F '\t' -v ip="$ip" '$1 == ip { print $2; exit }' "$NODES")
+	host=$(awk -F '\t' -v ip="$ip" '$1 == ip { print $3; exit }' "$NODES")
+	group=$(awk -F '\t' -v ip="$ip" '$1 == ip { print $4; exit }' "$NODES")
+	if [ -z "$host" ]; then
+		set -- $(list_candidates | awk -F '\t' -v ip="$ip" '$1 == ip && $2 != "0" { print $4, $3; exit }')
+		case "$1" in
+			legacy) group=manual-legacy ;;
+			*) group=manual-primary ;;
+		esac
+		loc=${2:-手动}
+		host=$(sample_host)
 	fi
-	decision=$(decide "$active" "$margin")
-	new_ip=$(printf '%s\n' "$decision" | awk -F '\t' 'NR==1 { print $1 }')
-	reason=$(printf '%s\n' "$decision" | awk -F '\t' 'NR==1 { print $2 }')
-	if valid_ip "$new_ip"; then
-		if [ "$(uci_get active_ip)" != "$new_ip" ]; then
-			uci set "xboxaccel.main.active_ip=$new_ip"
-			uci commit xboxaccel
-		fi
-		active=$new_ip
-	fi
-	if enabled && [ "$mode" = "dynamic" ]; then
-		if valid_ip "$new_ip"; then
-			publish_ip "$new_ip"
-			active=$new_ip
+	[ -n "$host" ] || host=$(sample_host)
+	[ -n "$loc" ] || loc=手动
+	[ -n "$group" ] || group=manual-primary
+	valid_host "$host" || host=$(sample_host)
+	mkdir -p "$PARTS"
+	probe_watch "$ip" "$host" "$(sample_path)" "$loc" "$group" "$limit" 12
+	if stale; then
+		restore_view
+		SWEEP=once
+		PROBE_IP=$ip
+		if [ -f "$STOP" ]; then
+			rm -f "$STOP"
+			OVERALL=stopped
+			date +%s > "$LAST"
+			log "测速已停止"
 		else
-			retract
-			active=
-			log "no healthy CDN address, DNS override removed"
+			log "这轮测速被新操作打断"
 		fi
-	elif enabled && [ "$mode" = "static" ]; then
-		active=$(uci_get static_ip)
-		reason=static
-	fi
-	write_status 0 "$reason" "$active" "$mode" "$margin"
-	date +%s > "$LAST"
-	log "test reason=$reason active=${active:-none}"
-}
-
-cmd_tick() {
-	local mode interval now last elapsed need
-	enabled || exit 0
-	mode=$(setting_mode)
-	[ "$mode" = "dynamic" ] || exit 0
-	interval=$(setting_interval)
-	now=$(date +%s)
-	last=0
-	[ -f "$LAST" ] && last=$(cat "$LAST" 2>/dev/null || echo 0)
-	echo "$last" | grep -Eq '^[0-9]+$' || last=0
-	elapsed=$((now - last))
-	need=$((interval * 60))
-	[ "$elapsed" -lt "$need" ] && exit 0
-	cmd_test
-}
-
-cmd_apply() {
-	local mode ip
-	mode=$(setting_mode)
-	if ! enabled; then
-		retract
-		remove_cron
-		write_status 0 disabled "$(uci_get active_ip)" "$mode" "$(setting_margin)"
+		write_status 0
 		return 0
 	fi
-	if [ "$mode" = "static" ]; then
-		remove_cron
-		ip=$(uci_get static_ip)
-		if valid_ip "$ip"; then
-			publish_ip "$ip"
-			write_status 0 static "$ip" static "$(setting_margin)"
-		else
-			retract
-			write_status 0 missing-ip "" static "$(setting_margin)"
-		fi
-		return 0
-	fi
-	install_cron
-	ip=$(uci_get active_ip)
-	if valid_ip "$ip"; then
-		publish_ip "$ip"
-		write_status 0 kept "$ip" dynamic "$(setting_margin)"
-	else
-		retract
-		write_status 0 missing-ip "" dynamic "$(setting_margin)"
-	fi
+	merge_one "$PARTS/$ip"
+	restore_view
+	SWEEP=once
+	PROBE_IP=$ip
+	OVERALL=probed
+	write_status 0
+	log "单点测速结束 $ip"
 }
 
-cmd_use() {
-	local ip="$1"
-	valid_ip "$ip" || {
-		echo "invalid ip" >&2
-		exit 1
-	}
-	uci set xboxaccel.main.mode='static'
-	uci set xboxaccel.main.enabled='1'
-	uci set "xboxaccel.main.static_ip=$ip"
-	uci set "xboxaccel.main.active_ip=$ip"
-	uci commit xboxaccel
-	remove_cron
-	# Show the choice before DNS restarts, including while a speed test is running.
-	if flock -n "$LOCK" -c true; then
-		write_status 0 static "$ip" static "$(setting_margin)"
-	else
-		write_status 1 running "$ip" static "$(setting_margin)"
+cmd_stop() {
+	local f pid
+	exec 7>"$LOCK"
+	if flock -n 7; then
+		flock -u 7
+		echo idle
+		return 0
 	fi
-	publish_ip "$ip"
-	log "static use $ip"
+	: > "$STOP"
+	bump_gen
+	for f in "$PARTS"/*.curl; do
+		[ -f "$f" ] || continue
+		pid=$(cat "$f" 2>/dev/null)
+		kill "$pid" 2>/dev/null
+	done
+	echo stopped
 }
 
 cmd_clear() {
-	retract
+	bump_gen
+	exec 9>"$LOCK"
+	flock 9
+	retract || true
 	remove_cron
-	write_status 0 disabled "" "$(setting_mode)" "$(setting_margin)"
+	PRIMARY=$(setting_primary)
+	LEGACY=$(setting_legacy)
+	PRIMARY_REASON=disabled
+	LEGACY_REASON=disabled
+	OVERALL=disabled
+	write_status 0
+	log "记录已撤回"
+}
+
+cmd_log() {
+	local n="${1:-200}"
+	case "$n" in
+		clear)
+			: > "$LOG.seed"
+			: > "$LOG"
+			printf '%s\t%s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "日志已清空" >> "$LOG"
+			return 0
+			;;
+	esac
+	case "$n" in ''|*[!0-9]*) n=200 ;; esac
+	[ "$n" -gt 300 ] && n=300
+	[ "$n" -lt 1 ] && n=1
+	seed_log
+	[ -s "$LOG" ] || return 0
+	tail -n "$n" "$LOG"
 }
 
 cmd_preview() {
-	local ip="$1" domain
-	[ -n "$ip" ] || ip=203.0.113.10
-	while read -r domain; do
-		case "$domain" in
-			''|'#'*) continue ;;
-		esac
-		echo "address=/${domain}/${ip}"
-	done < "$DOMAINS"
+	local primary="$1" legacy="$2"
+	[ -n "$primary" ] || primary=$(setting_primary)
+	[ -n "$legacy" ] || legacy=$(setting_legacy)
+	render_dns "$primary" "$legacy" "$(setting_pin)" /dev/stdout
+}
+
+cmd_check() {
+	"$POLICY" selftest || exit 1
+	"$ROSTER" selftest || exit 1
+	public_ipv4 203.0.113.10 || exit 1
+	public_ipv4 8.8.8.8 || exit 1
+	public_ipv4 100.128.0.1 || exit 1
+	public_ipv4 172.15.1.1 || exit 1
+	public_ipv4 172.32.1.1 || exit 1
+	public_ipv4 192.168.1.1 && exit 1
+	public_ipv4 10.0.0.1 && exit 1
+	public_ipv4 127.0.0.1 && exit 1
+	public_ipv4 172.16.5.1 && exit 1
+	public_ipv4 100.64.1.1 && exit 1
+	public_ipv4 0.0.0.0 && exit 1
+	public_ipv4 224.0.0.1 && exit 1
+	public_ipv4 255.255.255.255 && exit 1
+	echo PASS public
 }
 
 usage() {
-	echo "usage: xboxaccel {apply|clear|test|test-bg|tick|use ip|preview [ip]}"
+	echo "usage: xboxaccel {apply|clear|test [routine|thorough] [carrier]|test-bg sweep carrier|tick|use primary|legacy ip|probe ip|probe-bg ip|stop|preview [primary] [legacy]|check|log [n]|log clear}"
 	exit 1
 }
 
 case "${1:-}" in
 	apply) cmd_apply ;;
 	clear) cmd_clear ;;
-	test) cmd_test ;;
+	test) cmd_test "$2" "$3" ;;
 	test-bg)
-		if start-stop-daemon -S -b -x /usr/sbin/xboxaccel -- test; then
+		sweep=$2
+		carrier=$3
+		case "$sweep" in
+			routine|thorough) ;;
+			*) sweep=thorough ;;
+		esac
+		case "$carrier" in
+			any|telecom|unicom|mobile) ;;
+			*) carrier=$(setting_carrier) ;;
+		esac
+		exec 8>"$LOCK"
+		if ! flock -n 8; then
+			echo busy
 			exit 0
 		fi
-		/usr/sbin/xboxaccel test >/tmp/xboxaccel.test.log 2>&1 </dev/null &
+		flock -u 8
+		if start-stop-daemon -S -b -x /usr/sbin/xboxaccel -- test "$sweep" "$carrier"; then
+			exit 0
+		fi
+		/usr/sbin/xboxaccel test "$sweep" "$carrier" >/tmp/xboxaccel.test.log 2>&1 </dev/null &
 		exit 0
 		;;
 	tick) cmd_tick ;;
-	use) cmd_use "$2" ;;
-	preview) cmd_preview "$2" ;;
+	use) cmd_use "$2" "$3" ;;
+	probe) cmd_probe "$2" ;;
+	probe-bg)
+		ip=$2
+		public_ipv4 "$ip" || {
+			echo "这个地址不是公网 IPv4" >&2
+			exit 1
+		}
+		exec 8>"$LOCK"
+		if ! flock -n 8; then
+			echo busy
+			exit 0
+		fi
+		flock -u 8
+		if start-stop-daemon -S -b -x /usr/sbin/xboxaccel -- probe "$ip"; then
+			exit 0
+		fi
+		/usr/sbin/xboxaccel probe "$ip" >/tmp/xboxaccel.test.log 2>&1 </dev/null &
+		exit 0
+		;;
+	stop) cmd_stop ;;
+	preview) cmd_preview "$2" "$3" ;;
+	check) cmd_check ;;
+	log) cmd_log "$2" ;;
 	*) usage ;;
 esac

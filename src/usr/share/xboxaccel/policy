@@ -1,0 +1,136 @@
+#!/bin/sh
+# Interface
+#   policy decide <pool> <current> <margin> < results.tsv
+#   policy selftest
+# stdin columns, tab separated:
+#   ip http bps ms ok bytes group host loc
+# stdout is one line: <ip><TAB><reason>
+# pool is primary or legacy.
+# primary reads groups cn1 and manual-primary.
+# legacy reads groups cn2 and manual-legacy.
+# margin is a percent. A healthy current address is kept until another
+# healthy address in the same pool is faster by more than that percent.
+# Reasons: kept selected switched current-dead no-healthy no-candidate
+
+belongs() {
+	case "$1:$2" in
+		primary:cn1|primary:manual-primary|legacy:cn2|legacy:manual-legacy) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+decide() {
+	local pool="$1" current="$2" margin="$3"
+	local ip http bps ms ok bytes group host loc
+	local best_ip="" best_bps=0 seen=0 cur_ok=0 cur_bps=0
+
+	case "$margin" in
+		''|*[!0-9]*) margin=20 ;;
+	esac
+	while IFS="$(printf '\t')" read -r ip http bps ms ok bytes group host loc; do
+		[ -n "$ip" ] || continue
+		belongs "$pool" "$group" || continue
+		seen=1
+		[ "$ok" = "1" ] || continue
+		case "$bps" in
+			''|*[!0-9]*) continue ;;
+		esac
+		if [ -z "$best_ip" ] || [ "$bps" -gt "$best_bps" ]; then
+			best_ip=$ip
+			best_bps=$bps
+		fi
+		if [ "$ip" = "$current" ]; then
+			cur_ok=1
+			cur_bps=$bps
+		fi
+	done
+	if [ "$seen" -eq 0 ]; then
+		printf '\t%s\n' no-candidate
+		return 0
+	fi
+	if [ -z "$best_ip" ]; then
+		printf '\t%s\n' no-healthy
+		return 0
+	fi
+	if [ -z "$current" ] || [ "$cur_ok" != "1" ]; then
+		if [ -n "$current" ]; then
+			printf '%s\t%s\n' "$best_ip" current-dead
+		else
+			printf '%s\t%s\n' "$best_ip" selected
+		fi
+		return 0
+	fi
+	if [ "$best_ip" = "$current" ]; then
+		printf '%s\t%s\n' "$current" kept
+		return 0
+	fi
+	if awk -v b="$best_bps" -v c="$cur_bps" -v m="$margin" 'BEGIN { exit !(b > c * (100 + m) / 100) }'; then
+		printf '%s\t%s\n' "$best_ip" switched
+	else
+		printf '%s\t%s\n' "$current" kept
+	fi
+}
+
+row() {
+	printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+		"$1" "$2" "$3" "$4" "$5" "$6" "$7" "$8" "$9"
+}
+
+selftest() {
+	local FAIL=0 got want
+
+	want=$(printf '\t%s' no-candidate)
+	got=$(decide primary "" 20 </dev/null)
+	[ "$got" = "$want" ] && echo "PASS empty" || { echo "FAIL empty [$got]"; FAIL=1; }
+
+	want=$(printf '%s\t%s' 1.1.1.1 selected)
+	got=$( {
+		row 9.9.9.9 200 99999 1 1 1000 cn2 h L
+		row 1.1.1.1 200 100 1 1 1000 cn1 h L
+	} | decide primary "" 20 )
+	[ "$got" = "$want" ] && echo "PASS pool-isolation" || { echo "FAIL pool-isolation [$got]"; FAIL=1; }
+
+	want=$(printf '%s\t%s' 2.2.2.2 selected)
+	got=$( {
+		row 2.2.2.2 200 80 1 1 1000 manual-legacy h L
+	} | decide legacy "" 20 )
+	[ "$got" = "$want" ] && echo "PASS manual-legacy" || { echo "FAIL manual-legacy [$got]"; FAIL=1; }
+
+	want=$(printf '%s\t%s' 1.1.1.1 kept)
+	got=$( {
+		row 1.1.1.1 200 100 1 1 1000 cn1 h L
+		row 2.2.2.2 200 110 1 1 1000 cn1 h L
+	} | decide primary 1.1.1.1 20 )
+	[ "$got" = "$want" ] && echo "PASS hysteresis" || { echo "FAIL hysteresis [$got]"; FAIL=1; }
+
+	want=$(printf '%s\t%s' 2.2.2.2 switched)
+	got=$( {
+		row 1.1.1.1 200 100 1 1 1000 cn1 h L
+		row 2.2.2.2 200 150 1 1 1000 cn1 h L
+	} | decide primary 1.1.1.1 xx )
+	[ "$got" = "$want" ] && echo "PASS switch" || { echo "FAIL switch [$got]"; FAIL=1; }
+
+	want=$(printf '%s\t%s' 2.2.2.2 current-dead)
+	got=$( {
+		row 1.1.1.1 000 0 0 0 0 cn1 h L
+		row 2.2.2.2 206 40 1 1 1000 cn1 h L
+	} | decide primary 1.1.1.1 20 )
+	[ "$got" = "$want" ] && echo "PASS dead-current" || { echo "FAIL dead-current [$got]"; FAIL=1; }
+
+	want=$(printf '\t%s' no-healthy)
+	got=$( {
+		row 1.1.1.1 404 0 0 0 0 cn1 h L
+	} | decide primary "" 20 )
+	[ "$got" = "$want" ] && echo "PASS none-healthy" || { echo "FAIL none-healthy [$got]"; FAIL=1; }
+
+	exit "$FAIL"
+}
+
+case "${1:-}" in
+	decide) decide "$2" "$3" "$4" ;;
+	selftest) selftest ;;
+	*)
+		echo "usage: policy decide <pool> <current> <margin>" >&2
+		exit 1
+		;;
+esac

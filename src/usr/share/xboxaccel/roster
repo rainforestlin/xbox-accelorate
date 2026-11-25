@@ -1,0 +1,189 @@
+#!/bin/sh
+# Interface
+#   roster <routine|thorough> <any|telecom|unicom|mobile> <active-primary> <active-legacy> <history> [cap]
+# stdin columns, tab separated:
+#   ip loc host group en
+# history columns match the measurement table:
+#   ip http bps ms ok bytes group host loc
+# stdout is the selected stdin rows.
+# routine keeps a short list for the periodic check.
+# thorough spreads across locations and still prefers addresses that were fast last time.
+# Manual rows are kept (up to 8 per pool) even when the built-in cap is full.
+# An optional cap overrides the built-in size so selftest can force a small list.
+
+roster() {
+	local sweep="$1" carrier="$2" active_primary="$3" active_legacy="$4" history="$5" cap slots
+	case "$sweep" in
+		routine) cap=10; slots=7 ;;
+		thorough) cap=24; slots=8 ;;
+		*)
+			echo "usage: roster <routine|thorough> <carrier> <active-primary> <active-legacy> <history> [cap]" >&2
+			return 1
+			;;
+	esac
+	case "$carrier" in
+		any|telecom|unicom|mobile) ;;
+		*) carrier=any ;;
+	esac
+	case "$6" in
+		''|*[!0-9]*) ;;
+		*) cap=$6 ;;
+	esac
+	[ "$cap" -ge 1 ] || cap=1
+	[ "$slots" -gt "$cap" ] && slots=$cap
+	[ -f "$history" ] || : > "$history"
+	# An empty history file makes BusyBox awk treat the catalog as the history.
+	histfile=$(mktemp) || return 1
+	printf '%s\n' '-' > "$histfile"
+	[ -s "$history" ] && cat "$history" >> "$histfile"
+
+	awk -v carrier="$carrier" -v cap="$cap" -v slots="$slots" \
+		-v ap="$active_primary" -v al="$active_legacy" '
+		function pool_of(group) {
+			if (group == "cn1" || group == "manual-primary") return "primary"
+			if (group == "cn2" || group == "manual-legacy") return "legacy"
+			return ""
+		}
+		function allowed(group, loc) {
+			if (carrier == "any" || group ~ /^manual/) return 1
+			if (carrier == "telecom") return index(loc, "电信") > 0
+			if (carrier == "unicom") return index(loc, "联通") > 0
+			if (carrier == "mobile") return index(loc, "移动") > 0
+			return 0
+		}
+		function emit(pool, idx,    key) {
+			if (is_manual[pool, idx]) {
+				if (manuals[pool] >= 8) return
+				key = pool SUBSEP ip[pool, idx]
+				if (taken[key]) return
+				taken[key] = 1
+				manuals[pool]++
+				out[++nout] = line[pool, idx]
+				return
+			}
+			if (picked[pool] >= cap) return
+			key = pool SUBSEP ip[pool, idx]
+			if (taken[key]) return
+			taken[key] = 1
+			picked[pool]++
+			out[++nout] = line[pool, idx]
+		}
+		function select_pool(pool,    i, best, best_score, guard, total, step, seen, act) {
+			for (i = 1; i <= n[pool]; i++)
+				if (is_manual[pool, i]) emit(pool, i)
+			act = (pool == "primary") ? ap : al
+			for (i = 1; i <= n[pool]; i++)
+				if (is_builtin[pool, i] && ip[pool, i] == act) emit(pool, i)
+			for (guard = 1; guard <= slots; guard++) {
+				best = 0
+				best_score = -1
+				for (i = 1; i <= n[pool]; i++) {
+					if (!is_builtin[pool, i] || taken[pool SUBSEP ip[pool, i]]) continue
+					if (score[pool, i] > best_score) {
+						best_score = score[pool, i]
+						best = i
+					}
+				}
+				if (!best || best_score < 0) break
+				emit(pool, best)
+			}
+			total = 0
+			for (i = 1; i <= n[pool]; i++) if (is_builtin[pool, i]) total++
+			step = int(total / cap)
+			if (step < 1) step = 1
+			seen = 0
+			for (i = 1; i <= n[pool] && picked[pool] < cap; i++) {
+				if (!is_builtin[pool, i]) continue
+				seen++
+				if (step > 1 && (seen % step) != 1) continue
+				emit(pool, i)
+			}
+			for (i = 1; i <= n[pool] && picked[pool] < cap; i++)
+				if (is_builtin[pool, i]) emit(pool, i)
+		}
+		BEGIN { FS = "\t" }
+		FNR == NR {
+			if ($0 == "-") next
+			if ($1 != "" && $5 == 1 && $3 ~ /^[0-9]+$/) hist[$1] = $3 + 0
+			next
+		}
+		{
+			pool = pool_of($4)
+			if ($5 != 1 || $1 == "" || pool == "") next
+			if (!allowed($4, $2)) next
+			n[pool]++
+			ip[pool, n[pool]] = $1
+			line[pool, n[pool]] = $0
+			if ($4 ~ /^manual/) is_manual[pool, n[pool]] = 1
+			else is_builtin[pool, n[pool]] = 1
+			score[pool, n[pool]] = ($1 in hist) ? hist[$1] : -1
+		}
+		END {
+			select_pool("primary")
+			select_pool("legacy")
+			for (i = 1; i <= nout; i++) print out[i]
+		}
+	' "$histfile" -
+	status=$?
+	rm -f "$histfile"
+	return "$status"
+}
+
+ids() {
+	awk -F '\t' '{ print $1 }' | sort | awk '{ printf "%s%s", (NR > 1 ? " " : ""), $0 }'
+}
+
+selftest() {
+	local lab hist fail=0 got
+	lab=$(mktemp -d) || exit 1
+	hist="$lab/history"
+	: > "$hist"
+
+	got=$( {
+		printf '203.0.113.1\t广东 电信\th\tcn1\t1\n'
+		printf '203.0.113.2\t广东 联通\th\tcn1\t1\n'
+		printf '198.51.100.9\t手工\th\tmanual-primary\t1\n'
+	} | roster routine telecom "" "" "$hist" | ids )
+	[ "$got" = "198.51.100.9 203.0.113.1" ] && echo "PASS carrier" || { echo "FAIL carrier [$got]"; fail=1; }
+
+	got=$( {
+		printf '203.0.113.1\tA\th\tcn1\t1\n'
+		printf '203.0.113.2\tB\th\tcn1\t1\n'
+		printf '203.0.113.3\tC\th\tcn1\t1\n'
+		printf '203.0.113.4\tD\th\tcn1\t1\n'
+	} | roster thorough any "" "" "$hist" 2 | ids )
+	[ "$got" = "203.0.113.1 203.0.113.3" ] && echo "PASS stride" || { echo "FAIL stride [$got]"; fail=1; }
+
+	{
+		printf '203.0.113.1\t200\t10\t1\t1\t1000\tcn1\th\tA\n'
+		printf '203.0.113.2\t200\t100\t1\t1\t1000\tcn1\th\tB\n'
+		printf '203.0.113.3\t200\t40\t1\t1\t1000\tcn1\th\tC\n'
+		printf '203.0.113.4\t200\t5\t1\t1\t1000\tcn1\th\tD\n'
+	} > "$hist"
+	got=$( {
+		printf '203.0.113.1\tA\th\tcn1\t1\n'
+		printf '203.0.113.2\tB\th\tcn1\t1\n'
+		printf '203.0.113.3\tC\th\tcn1\t1\n'
+		printf '203.0.113.4\tD\th\tcn1\t1\n'
+	} | roster routine any "" "" "$hist" 2 | ids )
+	[ "$got" = "203.0.113.2 203.0.113.3" ] && echo "PASS history" || { echo "FAIL history [$got]"; fail=1; }
+
+	got=$( {
+		printf '203.0.113.1\tA\th\tcn1\t1\n'
+		printf '203.0.113.4\tD\th\tcn1\t1\n'
+		printf '198.51.100.8\t旧\th\tmanual-legacy\t1\n'
+	} | roster routine any 203.0.113.4 "" "$hist" 1 | ids )
+	[ "$got" = "198.51.100.8 203.0.113.4" ] && echo "PASS active" || { echo "FAIL active [$got]"; fail=1; }
+
+	rm -rf "$lab"
+	exit "$fail"
+}
+
+case "${1:-}" in
+	routine|thorough) roster "$@" ;;
+	selftest) selftest ;;
+	*)
+		echo "usage: roster <routine|thorough> <carrier> <active-primary> <active-legacy> <history> [cap]" >&2
+		exit 1
+		;;
+esac

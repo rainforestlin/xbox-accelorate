@@ -10,15 +10,29 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 IPK = ROOT / "ipk"
 DIST = ROOT / "dist"
-NAME = "luci-app-xboxaccel_1.0.0-1_all.ipk"
+def control_value(field: str) -> str:
+    for line in (IPK / "control").read_text(encoding="utf-8").splitlines():
+        if line.startswith(field + ":"):
+            return line.split(":", 1)[1].strip()
+    raise SystemExit(f"missing control field {field}")
 
-EXEC_SUFFIXES = {"/usr/sbin/xboxaccel", "/etc/init.d/xboxaccel"}
-TEXT_SUFFIXES = {".sh", ".js", ".json", ".conf", ""}
+
+NAME = "{0}_{1}_{2}.ipk".format(
+    control_value("Package"), control_value("Version"), control_value("Architecture")
+)
+EXEC_PATHS = {
+    "./usr/sbin/xboxaccel",
+    "./etc/init.d/xboxaccel",
+    "./usr/share/xboxaccel/policy",
+    "./usr/share/xboxaccel/roster",
+}
 
 
 def normalize(data: bytes, path: Path) -> bytes:
-    if path.suffix in {".js", ".json", ".py", ".md"} or path.name in {
+    if path.suffix in {".js", ".json", ".py", ".md", ".css", ".tsv", ".sh"} or path.name in {
         "xboxaccel",
+        "policy",
+        "roster",
         "control",
         "postinst",
         "prerm",
@@ -93,7 +107,7 @@ def main() -> None:
         if not path.is_file():
             continue
         rel = "./" + path.relative_to(SRC).as_posix()
-        mode = 0o755 if rel in {"./usr/sbin/xboxaccel", "./etc/init.d/xboxaccel"} else 0o644
+        mode = 0o755 if rel in EXEC_PATHS else 0o644
         data_files.append((rel, normalize(path.read_bytes(), path), mode))
 
     control_files = []

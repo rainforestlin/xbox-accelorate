@@ -1,5 +1,6 @@
 #!/bin/sh
 if [ -z "${IPKG_INSTROOT}" ]; then
+	rm -f /tmp/luci-indexcache /tmp/luci-indexcache.*
 	/etc/init.d/xboxaccel enable
 	/etc/init.d/xboxaccel start
 	/etc/init.d/rpcd reload >/dev/null 2>&1 || true

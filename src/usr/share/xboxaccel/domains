@@ -1,17 +1,17 @@
-# Xbox download hostnames. One exact name per line.
-assets1.xboxlive.com
-assets2.xboxlive.com
-d1.xboxlive.com
-d2.xboxlive.com
-xvcf1.xboxlive.com
-xvcf2.xboxlive.com
-dlassets.xboxlive.com
-dlassets2.xboxlive.com
-assets1.xboxlive.cn
-assets2.xboxlive.cn
-d1.xboxlive.cn
-d2.xboxlive.cn
-xvcf1.xboxlive.cn
-xvcf2.xboxlive.cn
-dlassets.xboxlive.cn
-dlassets2.xboxlive.cn
+# name	pool	edge
+assets1.xboxlive.com	primary	global
+assets2.xboxlive.com	primary	global
+d1.xboxlive.com	primary	global
+d2.xboxlive.com	primary	global
+xvcf1.xboxlive.com	primary	global
+xvcf2.xboxlive.com	primary	global
+assets1.xboxlive.cn	primary	cn
+assets2.xboxlive.cn	primary	cn
+d1.xboxlive.cn	primary	cn
+d2.xboxlive.cn	primary	cn
+xvcf1.xboxlive.cn	primary	cn
+xvcf2.xboxlive.cn	primary	cn
+dlassets.xboxlive.com	legacy	global
+dlassets2.xboxlive.com	legacy	global
+dlassets.xboxlive.cn	legacy	cn
+dlassets2.xboxlive.cn	legacy	cn
