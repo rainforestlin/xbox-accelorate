@@ -1,4 +1,5 @@
 #!/bin/sh
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-/usr/sbin:/usr/bin:/sbin:/bin}"
 # Facade for the Xbox CDN selector.
 # Callers only use: apply, clear, test, test-bg, tick, use, probe, probe-bg, stop, preview, check, log.
 # Selection rules live in /usr/share/xboxaccel/policy.
@@ -21,6 +22,15 @@ CRON_FILE=/etc/crontabs/root
 CRON_LINE='*/5 * * * * /usr/sbin/xboxaccel tick # xboxaccel'
 CONF_NAME=xboxaccel.conf
 LOG=/tmp/xboxaccel.log
+# .com names land here and answer HTTP 302. .cn names keep the selected CDN address.
+# 198.18.88.80/32 is added to the LAN bridge; nft sends only that address's port 80 to REDIR_PORT.
+REDIR_IP=198.18.88.80
+REDIR_PORT=8079
+REDIR_WANT=/tmp/xboxaccel.redir.want
+REDIR_PID=/var/run/xboxaccel.redir.pid
+REDIR_HTTP_PID=/var/run/xboxaccel.uhttpd.pid
+REDIR_DEVS=/tmp/xboxaccel.redir.devs
+REDIR_LOG=/tmp/xboxaccel.redir.log
 
 log() {
 	local lines
@@ -353,28 +363,286 @@ verify_published() {
 	[ "$fail" = 0 ]
 }
 
+redirect_in() {
+	grep -q "/${REDIR_IP}$" "$1" 2>/dev/null
+}
+
+share_dir() {
+	local dir
+	dir=$(CDPATH= cd -- "$(dirname "$0")/../share/xboxaccel" 2>/dev/null && pwd) || true
+	if [ -n "$dir" ] && [ -f "$dir/domains" ]; then
+		printf '%s\n' "$dir"
+		return 0
+	fi
+	printf '%s\n' /usr/share/xboxaccel
+}
+
+proc_matches() {
+	local pid="$1" mark="$2" line
+	[ -n "$pid" ] || return 1
+	kill -0 "$pid" 2>/dev/null || return 1
+	[ -r "/proc/$pid/cmdline" ] || return 0
+	line=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null || true)
+	printf '%s' "$line" | grep -q -- "$mark"
+}
+
+stop_pid() {
+	local pid="$1" mark="$2" i
+	proc_matches "$pid" "$mark" || return 0
+	kill "$pid" 2>/dev/null || true
+	i=0
+	while proc_matches "$pid" "$mark" && [ "$i" -lt 5 ]; do
+		sleep 1
+		i=$((i + 1))
+	done
+	proc_matches "$pid" "$mark" && kill -9 "$pid" 2>/dev/null || true
+}
+
+stop_redirect_procs() {
+	local pid
+	rm -f "$REDIR_WANT"
+	pid=$(cat "$REDIR_PID" 2>/dev/null || true)
+	stop_pid "$pid" "redir-run"
+	rm -f "$REDIR_PID"
+	pid=$(cat "$REDIR_HTTP_PID" 2>/dev/null || true)
+	stop_pid "$pid" "$REDIR_PORT"
+	rm -f "$REDIR_HTTP_PID"
+}
+
+lan_devs() {
+	local name dev seen
+	seen=$(mktemp) || return 1
+	if command -v ubus >/dev/null 2>&1 && command -v jsonfilter >/dev/null 2>&1; then
+		for name in $(ubus list 2>/dev/null | sed -n 's/^network\.interface\.//p'); do
+			case "$name" in
+				wan*|pppoe*|wwan*|modem*|loopback) continue ;;
+			esac
+			dev=$(ubus call "network.interface.${name}" status 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null || true)
+			[ -n "$dev" ] || continue
+			[ "$dev" = lo ] && continue
+			[ -d "/sys/class/net/$dev" ] || continue
+			grep -qxF -- "$dev" "$seen" && continue
+			printf '%s\n' "$dev" >> "$seen"
+		done
+	fi
+	if [ ! -s "$seen" ]; then
+		dev=$(uci -q get network.lan.device 2>/dev/null || true)
+		[ -n "$dev" ] || dev=br-lan
+		if [ -d "/sys/class/net/$dev" ]; then
+			printf '%s\n' "$dev" >> "$seen"
+		fi
+	fi
+	cat "$seen"
+	rm -f "$seen"
+}
+
+ensure_addrs() {
+	local dev ok=0 list
+	list=$(mktemp) || return 1
+	lan_devs > "$list" || { rm -f "$list"; return 1; }
+	if [ ! -s "$list" ]; then
+		rm -f "$list"
+		log "没有找到局域网接口，无法跳转"
+		return 1
+	fi
+	if [ -f "$REDIR_DEVS" ]; then
+		while IFS= read -r dev; do
+			[ -n "$dev" ] || continue
+			grep -qxF -- "$dev" "$list" && continue
+			ip addr del "${REDIR_IP}/32" dev "$dev" 2>/dev/null || true
+		done < "$REDIR_DEVS"
+	fi
+	while IFS= read -r dev; do
+		[ -n "$dev" ] || continue
+		if ip addr add "${REDIR_IP}/32" dev "$dev" 2>/dev/null || ip addr show dev "$dev" 2>/dev/null | grep -q "$REDIR_IP"; then
+			ok=1
+		else
+			log "没能把跳转地址加到 ${dev}"
+		fi
+	done < "$list"
+	mv "$list" "$REDIR_DEVS"
+	[ "$ok" = 1 ]
+}
+
+ensure_nft() {
+	local tmp
+	command -v nft >/dev/null 2>&1 || {
+		log "没有 nft，无法把 80 端口转到跳转服务"
+		return 1
+	}
+	tmp=$(mktemp) || return 1
+	cat > "$tmp" <<EOF
+delete table inet xboxaccel
+table inet xboxaccel {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		ip daddr ${REDIR_IP} tcp dport 80 redirect to :${REDIR_PORT}
+	}
+	chain output {
+		type nat hook output priority dstnat; policy accept;
+		ip daddr ${REDIR_IP} tcp dport 80 redirect to :${REDIR_PORT}
+	}
+}
+EOF
+	# The delete fails when the table is absent. Load the table either way.
+	nft -f "$tmp" >/tmp/xboxaccel.nft.log 2>&1 || nft -f - >>/tmp/xboxaccel.nft.log 2>&1 <<EOF
+table inet xboxaccel {
+	chain prerouting {
+		type nat hook prerouting priority dstnat; policy accept;
+		ip daddr ${REDIR_IP} tcp dport 80 redirect to :${REDIR_PORT}
+	}
+	chain output {
+		type nat hook output priority dstnat; policy accept;
+		ip daddr ${REDIR_IP} tcp dport 80 redirect to :${REDIR_PORT}
+	}
+}
+EOF
+	rm -f "$tmp"
+	nft list table inet xboxaccel >/dev/null 2>&1
+}
+
+redirect_healthy() {
+	local hdr
+	command -v curl >/dev/null 2>&1 || return 1
+	hdr=$(curl -4 -sS -D - -o /dev/null --max-redirs 0 --connect-timeout 1 --max-time 3 \
+		-H 'Host: assets1.xboxlive.com' \
+		"http://127.0.0.1:${REDIR_PORT}/Z/routing/extraextralarge.txt" 2>/dev/null || true)
+	printf '%s\n' "$hdr" | tr -d '\r' | grep -q "assets1.xboxlive.cn/Z/routing/extraextralarge.txt"
+}
+
+ensure_http() {
+	local i pid run
+	if redirect_healthy; then
+		return 0
+	fi
+	if [ ! -x /usr/sbin/uhttpd ] && ! command -v uhttpd >/dev/null 2>&1; then
+		log "没有 uhttpd，无法跳转国际域名"
+		return 1
+	fi
+	run=$(share_dir)/redir-run
+	[ -f "$run" ] || run=/usr/share/xboxaccel/redir-run
+	[ -f "$run" ] || {
+		log "缺少跳转程序"
+		return 1
+	}
+	stop_redirect_procs
+	: > "$REDIR_WANT"
+	: > "$REDIR_LOG"
+	if command -v nohup >/dev/null 2>&1; then
+		nohup /bin/sh "$run" >>"$REDIR_LOG" 2>&1 &
+	else
+		/bin/sh "$run" >>"$REDIR_LOG" 2>&1 &
+	fi
+	pid=$!
+	echo "$pid" > "$REDIR_PID"
+	i=0
+	while [ "$i" -lt 8 ]; do
+		redirect_healthy && return 0
+		i=$((i + 1))
+		sleep 1
+	done
+	log "跳转服务没有起来"
+	if [ -s "$REDIR_LOG" ]; then
+		while IFS= read -r line; do
+			log "跳转: ${line}"
+		done <<EOF
+$(tail -n 5 "$REDIR_LOG" 2>/dev/null)
+EOF
+	fi
+	return 1
+}
+
+setup_redirect() {
+	local was=0
+	redirect_healthy && was=1
+	if ! ensure_addrs || ! ensure_nft || ! ensure_http; then
+		return 1
+	fi
+	if [ "$was" != 1 ]; then
+		log "国际域名跳转已启动"
+	fi
+	return 0
+}
+
+teardown_redirect() {
+	local dev had=0
+	if [ -f "$REDIR_WANT" ] || [ -f "$REDIR_PID" ] || [ -f "$REDIR_DEVS" ]; then
+		had=1
+	fi
+	nft list table inet xboxaccel >/dev/null 2>&1 && had=1
+	stop_redirect_procs
+	nft delete table inet xboxaccel >/dev/null 2>&1 || true
+	if [ -f "$REDIR_DEVS" ]; then
+		while IFS= read -r dev; do
+			[ -n "$dev" ] || continue
+			ip addr del "${REDIR_IP}/32" dev "$dev" 2>/dev/null || true
+		done < "$REDIR_DEVS"
+		rm -f "$REDIR_DEVS"
+	fi
+	if [ "$had" = 1 ]; then
+		log "国际域名跳转已停止"
+	fi
+	return 0
+}
+
+finish_redirect() {
+	local dest="$1"
+	if redirect_in "$dest"; then
+		return 0
+	fi
+	teardown_redirect
+	return 0
+}
+
 render_dns() {
-	local primary="$1" legacy="$2" pin="$3" dest="$4" host pool edge ip
+	local primary="$1" legacy="$2" pin="$3" dest="$4"
+	local host pool edge ip have_primary=0 have_legacy=0 srv
+	public_ipv4 "$primary" && have_primary=1
+	public_ipv4 "$legacy" && have_legacy=1
 	: > "$dest"
 	echo '# generated by xboxaccel' >> "$dest"
 	while IFS="$(printf '\t')" read -r host pool edge extra; do
 		case "$host" in
 			''|'#'*) continue ;;
 		esac
-		case "$pool" in
-			primary) ip=$primary ;;
-			legacy) ip=$legacy ;;
-			*) continue ;;
-		esac
-		public_ipv4 "$ip" || continue
 		case "$edge" in
-			global) [ "$pin" = 1 ] || continue ;;
-			cn|'') ;;
+			cn|'')
+				case "$pool" in
+					primary) ip=$primary ;;
+					legacy) ip=$legacy ;;
+					*) continue ;;
+				esac
+				public_ipv4 "$ip" || continue
+				;;
+			global|hop)
+				# Domestic nodes reject Host: *.xboxlive.com. Send those names to the
+				# local redirector, which answers 302 to the matching .cn name.
+				[ "$pin" = 1 ] || continue
+				case "$pool" in
+					primary) [ "$have_primary" = 1 ] || continue ;;
+					legacy) [ "$have_legacy" = 1 ] || continue ;;
+					*) continue ;;
+				esac
+				ip=$REDIR_IP
+				;;
 			*) continue ;;
 		esac
 		printf 'local=/%s/\n' "$host" >> "$dest"
 		printf 'address=/%s/%s\n' "$host" "$ip" >> "$dest"
 	done < "$DOMAINS"
+	# Xbox asks assets-srvs for a spare CDN and then connects with Host: assets1.xboxlive.com.
+	# Point that SRV at the name we already redirect.
+	if [ "$pin" = 1 ] && [ "$have_primary" = 1 ]; then
+		for srv in \
+			assets-srvs.xboxlive.com \
+			assets-srvs-net.trafficmanager.net \
+			assets-srvs-apac.delivery.microsoft.com \
+			assets-srvs-na.delivery.microsoft.com
+		do
+			printf 'local=/%s/\n' "$srv" >> "$dest"
+			printf 'srv-host=%s,assets1.xboxlive.com,80,0,0\n' "$srv" >> "$dest"
+		done
+	fi
 }
 
 publish() {
@@ -385,8 +653,16 @@ publish() {
 	rm -f "$dir/xboxaccel.conf.bak" "$dir/xboxaccel.conf.mark" "$dir/xboxaccel.conf.retract"
 	tmp=$(mktemp) || return 1
 	render_dns "$primary" "$legacy" "$(setting_pin)" "$tmp"
+	if redirect_in "$tmp"; then
+		if ! setup_redirect; then
+			log "国际域名跳转没有启动，.com 保持原来的解析"
+			teardown_redirect
+			render_dns "$primary" "$legacy" 0 "$tmp"
+		fi
+	fi
 	if [ -f "$dest" ] && cmp -s "$tmp" "$dest"; then
 		rm -f "$tmp"
+		finish_redirect "$dest"
 		return 0
 	fi
 	# Backups must stay outside conf-dir. dnsmasq reads every file there.
@@ -401,6 +677,7 @@ publish() {
 	chmod 644 "$dest"
 	if /etc/init.d/dnsmasq restart >/tmp/xboxaccel.dns.log 2>&1 && verify_published "$dest"; then
 		rm -f /tmp/xboxaccel.conf.bak /tmp/xboxaccel.mark
+		finish_redirect "$dest"
 		return 0
 	fi
 	if [ -f /tmp/xboxaccel.mark ]; then
@@ -409,6 +686,11 @@ publish() {
 		mv -f /tmp/xboxaccel.conf.bak "$dest"
 	fi
 	/etc/init.d/dnsmasq restart >/tmp/xboxaccel.dns.log 2>&1 || true
+	if [ -f "$dest" ] && redirect_in "$dest"; then
+		setup_redirect || true
+	else
+		teardown_redirect
+	fi
 	log "dnsmasq 没有接受新记录，已退回上一份"
 	return 1
 }
@@ -417,10 +699,14 @@ retract() {
 	local dir dest
 	dir=$(confdir)
 	dest="$dir/$CONF_NAME"
-	[ -f "$dest" ] || return 0
+	if [ ! -f "$dest" ]; then
+		teardown_redirect
+		return 0
+	fi
 	mv "$dest" /tmp/xboxaccel.conf.retract || return 1
 	if /etc/init.d/dnsmasq restart >/tmp/xboxaccel.dns.log 2>&1 && dns_up; then
 		rm -f /tmp/xboxaccel.conf.retract
+		teardown_redirect
 		return 0
 	fi
 	mv /tmp/xboxaccel.conf.retract "$dest"
@@ -1206,6 +1492,18 @@ cmd_stop() {
 	echo stopped
 }
 
+cmd_repair() {
+	local dir dest
+	exec 9>"$LOCK"
+	# A speed test holds this lock for a long time. Skip rather than block hotplug.
+	flock -n 9 || exit 0
+	dir=$(confdir) || exit 0
+	dest="$dir/$CONF_NAME"
+	[ -f "$dest" ] || exit 0
+	redirect_in "$dest" || exit 0
+	setup_redirect
+}
+
 cmd_clear() {
 	bump_gen
 	exec 9>"$LOCK"
@@ -1246,9 +1544,86 @@ cmd_preview() {
 	render_dns "$primary" "$legacy" "$(setting_pin)" /dev/stdout
 }
 
+expect_redirect() {
+	local host="$1" uri="$2" location="$3" out script
+	script="$(share_dir)/www/cgi-bin/redirect"
+	out=$(HTTP_HOST="$host" REQUEST_URI="$uri" /bin/sh "$script" 2>/dev/null) || return 1
+	printf '%s\n' "$out" | tr -d '\r' | grep -q "Location: ${location}"
+}
+
+redirect_selftest() {
+	local tmp share script old
+	share=$(share_dir)
+	script="$share/www/cgi-bin/redirect"
+	[ -f "$script" ] || {
+		echo "redirect script missing" >&2
+		return 1
+	}
+	expect_redirect 'xvcf1.xboxlive.com' '/Z/routing/extraextralarge.txt' \
+		'http://assets1.xboxlive.cn/Z/routing/extraextralarge.txt' || return 1
+	expect_redirect 'Assets2.Xboxlive.Com:80' '/a?x=1' \
+		'http://assets1.xboxlive.cn/a?x=1' || return 1
+	expect_redirect 'dlassets2.xboxlive.com' '/old' \
+		'http://dlassets.xboxlive.cn/old' || return 1
+	expect_redirect 'assets1.xboxlive.com.edgesuite.net' '/cdn' \
+		'http://assets1.xboxlive.cn/cdn' || return 1
+	expect_redirect '5.xb.delivery.microsoft.com' '/g' \
+		'http://assets1.xboxlive.cn/g' || return 1
+	expect_redirect 'fg.microsoft.map.fastly.net' '/f' \
+		'http://assets1.xboxlive.cn/f' || return 1
+	expect_redirect 'cl-glcb907925.gcdn.co' '/c' \
+		'http://assets1.xboxlive.cn/c' || return 1
+	out=$(HTTP_HOST='example.com' REQUEST_URI='/' /bin/sh "$script") || return 1
+	printf '%s\n' "$out" | grep -q '404' || return 1
+	out=$(HTTP_HOST="$(printf 'assets1.xboxlive.com\r\nX: y')" REQUEST_URI="$(printf '/ok\r\nX: 1')" /bin/sh "$script") || return 1
+	printf '%s\n' "$out" | grep -q '400' || return 1
+	tmp=$(mktemp) || return 1
+	old=$DOMAINS
+	DOMAINS="$share/domains"
+	render_dns 219.152.87.113 '' 1 "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	grep -q '^address=/assets1.xboxlive.cn/219.152.87.113$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	grep -q '^address=/assets1.xboxlive.com/198.18.88.80$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	grep -q '^address=/xvcf2.xboxlive.com/198.18.88.80$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	grep -q '^address=/5.xb.delivery.microsoft.com/198.18.88.80$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	grep -q '^srv-host=assets-srvs-net.trafficmanager.net,assets1.xboxlive.com,80,0,0$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	if grep -q '^address=/assets1.xboxlive.com/219.152.87.113$' "$tmp" || grep -q 'dlassets.xboxlive.com' "$tmp"; then
+		DOMAINS=$old
+		rm -f "$tmp"
+		echo "com must not share the cdn address" >&2
+		return 1
+	fi
+	render_dns 219.152.87.113 '' 0 "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	if grep -q 'xboxlive.com/' "$tmp" || grep -q '^srv-host=' "$tmp"; then
+		DOMAINS=$old
+		rm -f "$tmp"
+		echo "pin off still rewrote com" >&2
+		return 1
+	fi
+	grep -q '^address=/assets1.xboxlive.cn/219.152.87.113$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	render_dns '' 203.0.113.10 1 "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	grep -q '^address=/dlassets.xboxlive.com/198.18.88.80$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	grep -q '^address=/dlassets.xboxlive.cn/203.0.113.10$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	if grep -q 'assets1.xboxlive.com' "$tmp" || grep -q '^srv-host=' "$tmp"; then
+		DOMAINS=$old
+		rm -f "$tmp"
+		echo "legacy redirect included primary com" >&2
+		return 1
+	fi
+	DOMAINS=$old
+	rm -f "$tmp"
+	echo PASS redirect
+}
+
 cmd_check() {
-	"$POLICY" selftest || exit 1
-	"$ROSTER" selftest || exit 1
+	local share policy roster
+	share=$(share_dir)
+	policy=$POLICY
+	roster=$ROSTER
+	[ -f "$policy" ] || policy="$share/policy"
+	[ -f "$roster" ] || roster="$share/roster"
+	/bin/sh "$policy" selftest || exit 1
+	/bin/sh "$roster" selftest || exit 1
+	redirect_selftest || exit 1
 	public_ipv4 203.0.113.10 || exit 1
 	public_ipv4 8.8.8.8 || exit 1
 	public_ipv4 100.128.0.1 || exit 1
@@ -1266,13 +1641,14 @@ cmd_check() {
 }
 
 usage() {
-	echo "usage: xboxaccel {apply|clear|test [routine|thorough] [carrier]|test-bg sweep carrier|tick|use primary|legacy ip|probe ip|probe-bg ip|stop|preview [primary] [legacy]|check|log [n]|log clear}"
+	echo "usage: xboxaccel {apply|clear|repair|test [routine|thorough] [carrier]|test-bg sweep carrier|tick|use primary|legacy ip|probe ip|probe-bg ip|stop|preview [primary] [legacy]|check|log [n]|log clear}"
 	exit 1
 }
 
 case "${1:-}" in
 	apply) cmd_apply ;;
 	clear) cmd_clear ;;
+	repair) cmd_repair ;;
 	test) cmd_test "$2" "$3" ;;
 	test-bg)
 		sweep=$2

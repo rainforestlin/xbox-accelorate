@@ -1,5 +1,5 @@
 Package: luci-app-xboxaccel
-Version: 1.1.0-1
+Version: 1.2.0-1
 Depends: libc, luci-base, curl
 Architecture: all
 Installed-Size: 16
@@ -8,3 +8,4 @@ License: Apache-2.0
 Maintainer: xboxaccel
 Description: Xbox download CDN selector for OpenWrt.
  Keeps separate primary and legacy addresses, suppresses AAAA for those names, and checks dnsmasq before leaving a new record in place.
+ International download names are answered with an HTTP redirect to the .cn host instead of being pinned to the CDN address.

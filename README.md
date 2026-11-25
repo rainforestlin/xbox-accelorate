@@ -6,10 +6,10 @@
 
 ## 安装
 
-从本仓库的 Releases 页面下载 `luci-app-xboxaccel_1.0.0-1_all.ipk`，拷到路由器后执行：
+从本仓库的 Releases 页面下载 `luci-app-xboxaccel_1.2.0-1_all.ipk`，拷到路由器后执行：
 
 ```sh
-opkg install /tmp/luci-app-xboxaccel_1.0.0-1_all.ipk
+opkg install /tmp/luci-app-xboxaccel_1.2.0-1_all.ipk
 ```
 
 安装完成后，在 LuCI 打开 **服务 → Xbox 下载选点**。
@@ -22,7 +22,7 @@ opkg install /tmp/luci-app-xboxaccel_1.0.0-1_all.ipk
 python tools/build_ipk.py
 ```
 
-产物在 `dist/luci-app-xboxaccel_1.0.0-1_all.ipk`。用 OpenWrt SDK 编译时，把本仓库当作一个软件包目录即可，`Makefile` 会装入同一套文件。
+产物在 `dist/luci-app-xboxaccel_1.2.0-1_all.ipk`。用 OpenWrt SDK 编译时，把本仓库当作一个软件包目录即可，`Makefile` 会装入同一套文件。
 
 ## 让 Xbox 用到选点
 
@@ -31,7 +31,9 @@ python tools/build_ipk.py
 3. 把 Xbox 的 DNS 改成这台路由器的局域网地址，端口用默认的 53。
 4. 按下面两种模式之一启用节点。
 
-改写的域名是这些名字的 `.xboxlive.com` 和 `.xboxlive.cn`：`assets1`、`assets2`、`d1`、`d2`、`xvcf1`、`xvcf2`、`dlassets`、`dlassets2`。它们会指向同一个选中的 IPv4。
+`.xboxlive.cn` 直接指向选中的 IPv4。`.xboxlive.com` 在「国际域名跳转到国内域名」打开时指向路由器自己，由路由器返回 HTTP 302：主下载名（`assets1`、`assets2`、`d1`、`d2`、`xvcf1`、`xvcf2`）跳到 `assets1.xboxlive.cn`，旧下载名（`dlassets`、`dlassets2`）跳到 `dlassets.xboxlive.cn`。国内节点只认 `.cn` 的主机名，把两个名字解析成同一个地址会被拒绝。
+
+备用 CDN 名 `5.xb.delivery.microsoft.com`、`assets1.xboxlive.com.edgesuite.net`、`cl-glcb907925.gcdn.co`、`fg.microsoft.map.fastly.net` 同样跳到 `assets1.xboxlive.cn`。`assets-srvs.xboxlive.com` 及其 SRV 目标改写成 `assets1.xboxlive.com:80`，避免主机中途改走海外 CDN。做法与 [XboxDownload](https://github.com/skydevil88/XboxDownload) 的 OpenWrt 说明一致，但不改管理页的 80 端口。
 
 ## 静态模式
 
@@ -53,7 +55,7 @@ python tools/build_ipk.py
 
 内置列表是公开的 Xbox 国内 IPv4 节点。额外地址可以在「额外 IP」里添加。把列表中已有 IP 的「参与」关掉，即可让它不参加测速。
 
-选中的地址发生变化时会重启 dnsmasq，使新记录生效。重启期间解析会短暂停一下。插件不修改防火墙，也不占用管理页端口。
+选中的地址发生变化时会重启 dnsmasq，使新记录生效。重启期间解析会短暂停一下。跳转监听在本机 `8079` 端口。一条独立的 nft 规则只把 `198.18.88.80:80` 转过来，管理页仍用原来的 80 端口。保存后让 Xbox 重新连接无线，清掉已经缓存的地址。主机 DNS 只填这台路由器；这些名字不再返回 IPv6。
 
 ## 许可
 

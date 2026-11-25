@@ -15,3 +15,8 @@ dlassets.xboxlive.com	legacy	global
 dlassets2.xboxlive.com	legacy	global
 dlassets.xboxlive.cn	legacy	cn
 dlassets2.xboxlive.cn	legacy	cn
+# Spare CDN names. Xbox still sends Host: assets1.xboxlive.com to these.
+5.xb.delivery.microsoft.com	primary	hop
+assets1.xboxlive.com.edgesuite.net	primary	hop
+cl-glcb907925.gcdn.co	primary	hop
+fg.microsoft.map.fastly.net	primary	hop

@@ -1,0 +1,35 @@
+#!/bin/sh
+# Keep the local 302 listener up. xboxaccel creates /tmp/xboxaccel.redir.want
+# before starting this script and deletes that file to stop it.
+WANT=/tmp/xboxaccel.redir.want
+PID=/var/run/xboxaccel.uhttpd.pid
+PORT=8079
+UHTTPD=/usr/sbin/uhttpd
+child=
+
+on_stop() {
+	rm -f "$PID"
+	[ -n "$child" ] && kill "$child" 2>/dev/null
+	exit 0
+}
+trap on_stop TERM INT
+
+[ -x "$UHTTPD" ] || UHTTPD=$(command -v uhttpd || true)
+[ -n "$UHTTPD" ] || exit 1
+
+while [ -f "$WANT" ]; do
+	"$UHTTPD" -f -D \
+		-h /usr/share/xboxaccel/www \
+		-c /usr/share/xboxaccel/uhttpd.empty \
+		-p "0.0.0.0:${PORT}" \
+		-x /cgi-bin \
+		-y '/=/cgi-bin/redirect' \
+		-t 5 -T 15 -k 2 -n 64 &
+	child=$!
+	echo "$child" > "$PID"
+	wait "$child"
+	child=
+	rm -f "$PID"
+	[ -f "$WANT" ] || break
+	sleep 1
+done

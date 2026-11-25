@@ -1,0 +1,37 @@
+#!/bin/sh
+# HTTP 302 for Xbox download names. uhttpd invokes this as CGI.
+# .com and the spare CDN names go to the .cn host the selected node actually accepts.
+
+# A CR or LF in the host or path would split the Location header.
+orig_len=$(printf '%s' "${HTTP_HOST:-}${REQUEST_URI:-}" | wc -c)
+flat_len=$(printf '%s' "${HTTP_HOST:-}${REQUEST_URI:-}" | tr -d '\r\n' | wc -c)
+if [ "$orig_len" -ne "$flat_len" ]; then
+	printf 'Status: 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+	exit 0
+fi
+
+host=$(printf '%s' "${HTTP_HOST:-}" | tr 'A-Z' 'a-z')
+host=${host%%:*}
+host=${host%.}
+uri=${REQUEST_URI:-/}
+case "$uri" in
+	/*) ;;
+	*) uri=/ ;;
+esac
+
+target=
+case "$host" in
+	dlassets.xboxlive.com|dlassets2.xboxlive.com)
+		target=dlassets.xboxlive.cn
+		;;
+	assets1.xboxlive.com|assets2.xboxlive.com|d1.xboxlive.com|d2.xboxlive.com|xvcf1.xboxlive.com|xvcf2.xboxlive.com|5.xb.delivery.microsoft.com|assets1.xboxlive.com.edgesuite.net|cl-glcb907925.gcdn.co|fg.microsoft.map.fastly.net)
+		target=assets1.xboxlive.cn
+		;;
+esac
+
+if [ -z "$target" ]; then
+	printf 'Status: 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
+	exit 0
+fi
+
+printf 'Status: 302 Found\r\nLocation: http://%s%s\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' "$target" "$uri"

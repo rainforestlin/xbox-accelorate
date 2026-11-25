@@ -25,6 +25,8 @@ EXEC_PATHS = {
     "./etc/init.d/xboxaccel",
     "./usr/share/xboxaccel/policy",
     "./usr/share/xboxaccel/roster",
+    "./usr/share/xboxaccel/redir-run",
+    "./usr/share/xboxaccel/www/cgi-bin/redirect",
 }
 
 
@@ -38,6 +40,10 @@ def normalize(data: bytes, path: Path) -> bytes:
         "prerm",
         "conffiles",
         "domains",
+        "redirect",
+        "redir-run",
+        "uhttpd.empty",
+        "99-xboxaccel",
     }:
         return data.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
     return data

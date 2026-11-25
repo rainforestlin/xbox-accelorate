@@ -1,0 +1,5 @@
+#!/bin/sh
+# The redirect address lives on the LAN device and disappears when that device is recreated.
+[ "$ACTION" = ifup ] || exit 0
+[ -x /usr/sbin/xboxaccel ] || exit 0
+/usr/sbin/xboxaccel repair

@@ -1,7 +1,7 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-xboxaccel
-PKG_VERSION:=1.1.0
+PKG_VERSION:=1.2.0
 PKG_RELEASE:=1
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=xboxaccel
@@ -34,6 +34,8 @@ define Package/luci-app-xboxaccel/install
 	$(INSTALL_BIN) ./src/usr/sbin/xboxaccel $(1)/usr/sbin/xboxaccel
 	$(INSTALL_DIR) $(1)/etc/init.d
 	$(INSTALL_BIN) ./src/etc/init.d/xboxaccel $(1)/etc/init.d/xboxaccel
+	$(INSTALL_DIR) $(1)/etc/hotplug.d/iface
+	$(INSTALL_BIN) ./src/etc/hotplug.d/iface/99-xboxaccel $(1)/etc/hotplug.d/iface/99-xboxaccel
 	$(INSTALL_DIR) $(1)/etc/config
 	$(INSTALL_CONF) ./src/etc/config/xboxaccel $(1)/etc/config/xboxaccel
 	$(INSTALL_DIR) $(1)/usr/share/xboxaccel
@@ -41,6 +43,10 @@ define Package/luci-app-xboxaccel/install
 	$(INSTALL_BIN) ./src/usr/share/xboxaccel/roster $(1)/usr/share/xboxaccel/roster
 	$(INSTALL_DATA) ./src/usr/share/xboxaccel/domains $(1)/usr/share/xboxaccel/domains
 	$(INSTALL_DATA) ./src/usr/share/xboxaccel/nodes.tsv $(1)/usr/share/xboxaccel/nodes.tsv
+	$(INSTALL_BIN) ./src/usr/share/xboxaccel/redir-run $(1)/usr/share/xboxaccel/redir-run
+	$(INSTALL_DATA) ./src/usr/share/xboxaccel/uhttpd.empty $(1)/usr/share/xboxaccel/uhttpd.empty
+	$(INSTALL_DIR) $(1)/usr/share/xboxaccel/www/cgi-bin
+	$(INSTALL_BIN) ./src/usr/share/xboxaccel/www/cgi-bin/redirect $(1)/usr/share/xboxaccel/www/cgi-bin/redirect
 	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
 	$(INSTALL_DATA) ./src/usr/share/luci/menu.d/luci-app-xboxaccel.json $(1)/usr/share/luci/menu.d/luci-app-xboxaccel.json
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d

@@ -608,8 +608,8 @@ return view.extend({
 		carrier.value('mobile', _('移动'));
 		carrier.rmempty = false;
 
-		var pin = s.option(form.Flag, 'pin_global', _('国际域名也指向选中的地址'),
-			_('关闭后只改写 .xboxlive.cn。.xboxlive.com 保持原来的解析，避免部分节点拒绝主机名。'));
+		var pin = s.option(form.Flag, 'pin_global', _('国际域名跳转到国内域名'),
+			_('打开后，.xboxlive.com 解析到本机并 302 到对应的 .xboxlive.cn，文件仍从选中的国内节点下载。关掉后 .com 恢复原来的解析。国内节点只认 .cn 的主机名，把两个名字指到同一个地址会被拒绝。保存后让主机重新连接无线，清掉已经缓存的地址。'));
 		pin.default = '1';
 		pin.rmempty = false;
 
@@ -853,7 +853,7 @@ return view.extend({
 					E('section', { 'class': 'xa-tile' }, [
 						E('p', { 'class': 'xa-k' }, ['范围']),
 						E('p', { 'class': 'xa-v' }, ['仅本机 53 端口']),
-						E('p', { 'class': 'xa-s' }, ['不改防火墙，不占用 80 端口'])
+						E('p', { 'class': 'xa-s' }, ['跳转不占用管理页的 80 端口'])
 					])
 				]),
 				node
