@@ -116,12 +116,13 @@ sample_bytes() {
 }
 
 write_status() {
-	local running="$1" reason="$2" active="$3" mode="$4" margin="$5" first=1
+	local running="$1" reason="$2" active="$3" mode="$4" margin="$5" first=1 en=0
 	local tmp ip http bps ms ok bytes group host loc loc_json
+	enabled && en=1
 	tmp=$(mktemp)
 	{
-		printf '{"running":%s,"time":%s,"mode":"%s","active":"%s","reason":"%s","margin":%s,"results":[' \
-			"$running" "$(date +%s)" "$mode" "$active" "$reason" "$margin"
+		printf '{"running":%s,"enabled":%s,"time":%s,"mode":"%s","active":"%s","reason":"%s","margin":%s,"results":[' \
+			"$running" "$en" "$(date +%s)" "$mode" "$active" "$reason" "$margin"
 		if [ -f "$RESULTS" ]; then
 			while IFS="$(printf '\t')" read -r ip http bps ms ok bytes group host loc; do
 				[ -n "$ip" ] || continue
@@ -325,7 +326,11 @@ run_probes() {
 			wait
 			n=0
 			collect_parts
-			write_status 1 running "$(uci_get active_ip)" "$(setting_mode)" "$(setting_margin)"
+			if [ "$(setting_mode)" = "static" ] && enabled; then
+				write_status 1 running "$(uci_get static_ip)" static "$(setting_margin)"
+			else
+				write_status 1 running "$(uci_get active_ip)" "$(setting_mode)" "$(setting_margin)"
+			fi
 		fi
 	done << EOF
 $(list_targets)
@@ -392,6 +397,14 @@ cmd_test() {
 	: > "$RESULTS"
 	write_status 1 running "$active" "$mode" "$margin"
 	run_probes
+	mode=$(setting_mode)
+	if [ "$mode" = "static" ] && enabled; then
+		active=$(uci_get static_ip)
+		write_status 0 static "$active" static "$(setting_margin)"
+		date +%s > "$LAST"
+		log "test kept static active=${active:-none}"
+		return 0
+	fi
 	decision=$(decide "$active" "$margin")
 	new_ip=$(printf '%s\n' "$decision" | awk -F '\t' 'NR==1 { print $1 }')
 	reason=$(printf '%s\n' "$decision" | awk -F '\t' 'NR==1 { print $2 }')
@@ -477,10 +490,16 @@ cmd_use() {
 	uci set xboxaccel.main.mode='static'
 	uci set xboxaccel.main.enabled='1'
 	uci set "xboxaccel.main.static_ip=$ip"
+	uci set "xboxaccel.main.active_ip=$ip"
 	uci commit xboxaccel
 	remove_cron
+	# Show the choice before DNS restarts, including while a speed test is running.
+	if flock -n "$LOCK" -c true; then
+		write_status 0 static "$ip" static "$(setting_margin)"
+	else
+		write_status 1 running "$ip" static "$(setting_margin)"
+	fi
 	publish_ip "$ip"
-	write_status 0 static "$ip" static "$(setting_margin)"
 	log "static use $ip"
 }
 

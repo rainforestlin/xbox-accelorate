@@ -69,7 +69,7 @@ function currentMode() {
 	return el && el.value ? el.value : '';
 }
 
-function useNode(ip) {
+function useNode(ip, done) {
 	ui.showModal(_('启用节点'), [
 		E('p', { 'class': 'spinning' }, [_('正在启用 ') + ip + _(' …')])
 	]);
@@ -79,7 +79,12 @@ function useNode(ip) {
 			ui.addNotification(null, E('p', {}, [res.stderr || res.stdout || _('启用失败')]));
 			return;
 		}
-		window.location.reload();
+		var sel = document.getElementById('widget.cbid.xboxaccel.main.mode') ||
+			document.getElementById('cbid.xboxaccel.main.mode');
+		if (sel)
+			sel.value = 'static';
+		if (done)
+			return done();
 	}).catch(function(err) {
 		ui.hideModal();
 		ui.addNotification(null, E('p', {}, [err.message || _('启用失败')]));
@@ -113,7 +118,7 @@ function renderBoard(catalog, text) {
 	var tested = (data.results || []).length;
 	var when = data.time ? new Date(data.time * 1000).toLocaleString() : '';
 	var staticMode = currentMode() === 'static' || (!currentMode() && data.mode === 'static');
-	var inUse = data.reason !== 'disabled' && data.reason !== 'missing-ip' && data.reason !== 'running';
+	var inUse = data.enabled === 1 && !!data.active && data.reason !== 'disabled' && data.reason !== 'missing-ip';
 	var fastest = '';
 	rows.forEach(function(item) {
 		if (item.node.group !== 'cn1' && item.node.group !== 'manual')
@@ -138,7 +143,7 @@ function renderBoard(catalog, text) {
 	rows.forEach(function(item) {
 		var row = item.measured;
 		var using = inUse && data.active === item.node.ip;
-		var label = !row ? '待测速' : (row.ok ? (using ? '使用中' : (item.node.ip === fastest ? '最快' : (staticMode ? '点击启用' : '可用'))) : ('HTTP ' + (row.http || 0)));
+		var label = using ? '使用中' : (!row ? '待测速' : (row.ok ? (item.node.ip === fastest ? '最快' : (staticMode ? '点击启用' : '可用')) : ('HTTP ' + (row.http || 0))));
 		var tr = E('tr', {
 			'class': 'tr',
 			'style': (using ? 'background:rgba(32,128,64,.16);' : '') + (staticMode ? 'cursor:pointer' : '')
@@ -154,7 +159,12 @@ function renderBoard(catalog, text) {
 		tr.addEventListener('click', function() {
 			if (currentMode() !== 'static')
 				return;
-			useNode(item.node.ip);
+			useNode(item.node.ip, function() {
+				return fs.read('/tmp/xboxaccel.status').then(function(text) {
+					if (window.xboxaccelPaint)
+						window.xboxaccelPaint(text);
+				});
+			});
 		});
 		table.appendChild(tr);
 	});
@@ -257,6 +267,7 @@ return view.extend({
 				box.removeChild(box.firstChild);
 			box.appendChild(renderBoard(catalog, text));
 		}
+		window.xboxaccelPaint = paint;
 
 		return m.render().then(function(node) {
 			paint(statusText);
