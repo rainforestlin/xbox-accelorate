@@ -1,0 +1,18 @@
+{
+	"admin/services/xboxaccel": {
+		"title": "Xbox 下载选点",
+		"order": 90,
+		"action": {
+			"type": "view",
+			"path": "xboxaccel"
+		},
+		"depends": {
+			"acl": [ "luci-app-xboxaccel" ],
+			"uci": { "xboxaccel": true },
+			"fs": {
+				"/usr/sbin/xboxaccel": "executable",
+				"/etc/init.d/xboxaccel": "executable"
+			}
+		}
+	}
+}

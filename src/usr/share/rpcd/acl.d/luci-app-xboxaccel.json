@@ -1,0 +1,18 @@
+{
+	"luci-app-xboxaccel": {
+		"description": "Grant UCI and command access for the Xbox CDN selector",
+		"read": {
+			"uci": [ "xboxaccel" ],
+			"file": {
+				"/usr/sbin/xboxaccel": [ "exec" ],
+				"/etc/init.d/xboxaccel": [ "exec" ],
+				"/tmp/xboxaccel.status": [ "read" ],
+				"/usr/share/xboxaccel/domains": [ "read" ],
+				"/usr/share/xboxaccel/nodes.tsv": [ "read" ]
+			}
+		},
+		"write": {
+			"uci": [ "xboxaccel" ]
+		}
+	}
+}

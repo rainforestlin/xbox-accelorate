@@ -1,0 +1,50 @@
+include $(TOPDIR)/rules.mk
+
+PKG_NAME:=luci-app-xboxaccel
+PKG_VERSION:=1.0.0
+PKG_RELEASE:=1
+PKG_LICENSE:=Apache-2.0
+PKG_MAINTAINER:=xboxaccel
+
+include $(INCLUDE_DIR)/package.mk
+
+define Package/luci-app-xboxaccel
+  SECTION:=luci
+  CATEGORY:=LuCI
+  SUBMENU:=3. Applications
+  TITLE:=Xbox download CDN selector
+  DEPENDS:=+curl +luci-base
+  PKGARCH:=all
+endef
+
+define Package/luci-app-xboxaccel/description
+  Resolve Xbox download hostnames to a selected CDN address for clients
+  that use this router's DNS on port 53.
+endef
+
+define Package/luci-app-xboxaccel/conffiles
+/etc/config/xboxaccel
+endef
+
+define Build/Compile
+endef
+
+define Package/luci-app-xboxaccel/install
+	$(INSTALL_DIR) $(1)/usr/sbin
+	$(INSTALL_BIN) ./src/usr/sbin/xboxaccel $(1)/usr/sbin/xboxaccel
+	$(INSTALL_DIR) $(1)/etc/init.d
+	$(INSTALL_BIN) ./src/etc/init.d/xboxaccel $(1)/etc/init.d/xboxaccel
+	$(INSTALL_DIR) $(1)/etc/config
+	$(INSTALL_CONF) ./src/etc/config/xboxaccel $(1)/etc/config/xboxaccel
+	$(INSTALL_DIR) $(1)/usr/share/xboxaccel
+	$(INSTALL_DATA) ./src/usr/share/xboxaccel/domains $(1)/usr/share/xboxaccel/domains
+	$(INSTALL_DATA) ./src/usr/share/xboxaccel/nodes.tsv $(1)/usr/share/xboxaccel/nodes.tsv
+	$(INSTALL_DIR) $(1)/usr/share/luci/menu.d
+	$(INSTALL_DATA) ./src/usr/share/luci/menu.d/luci-app-xboxaccel.json $(1)/usr/share/luci/menu.d/luci-app-xboxaccel.json
+	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
+	$(INSTALL_DATA) ./src/usr/share/rpcd/acl.d/luci-app-xboxaccel.json $(1)/usr/share/rpcd/acl.d/luci-app-xboxaccel.json
+	$(INSTALL_DIR) $(1)/www/luci-static/resources/view
+	$(INSTALL_DATA) ./src/www/luci-static/resources/view/xboxaccel.js $(1)/www/luci-static/resources/view/xboxaccel.js
+endef
+
+$(eval $(call BuildPackage,luci-app-xboxaccel))
