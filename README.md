@@ -56,6 +56,31 @@ python tools/build_ipk.py
 - 源站 IP 由「源站解析 DNS」解析，缓存在 `/tmp/xboxaccel.origins`，默认 6 小时刷新；解析失败的 host 不写假地址，退回正常 DNS，HTTP 不会加速但 HTTPS 不会被黑洞。
 - 旧版本的单个 `198.18.88.80` 会在升级时清理；新地址段避开 Clash 常见 `198.18.0.0/16`，仍建议把 `redirect_net` 排除在代理 fake-IP/路由之外。
 
+### HTTPS 不会走选中的 CDN 节点
+
+当前实现只把 `.com` 的 443 **回源到真实源站**，不会把 HTTPS 转到选中的国内节点。2026-11-26 手工测试：
+
+```sh
+# 同一个节点，.com SNI：TLS 握手失败
+curl -k -o /dev/null -sS --max-time 15 \
+  --resolve assets1.xboxlive.com:443:219.152.87.113 \
+  -w 'com %{http_code}\n' \
+  https://assets1.xboxlive.com/Z/routing/extraextralarge.txt
+
+# 同一个节点，.cn SNI：200，能传输数据
+curl -k -o /dev/null -sS --max-time 15 \
+  --resolve assets1.xboxlive.cn:443:219.152.87.113 \
+  -w 'cn %{http_code}\n' \
+  https://assets1.xboxlive.cn/Z/routing/extraextralarge.txt
+```
+
+结果：`.com` 返回 `000`，curl 报 TLS 握手失败（`SEC_E_ILLEGAL_MESSAGE`）；`.cn` 返回 `200` 并有数据。节点按 TLS SNI 选择 vhost，`assets1.xboxlive.com` 的 SNI 不被国内节点接受。因此：
+
+- 不能靠“把 443 DNAT 到选中节点”加速 `.com` HTTPS；TLS 握手就会失败。
+- 要真正让 `.com` HTTPS 走选中的 `.cn` 节点，必须在本机终止 TLS（MITM/本地证书），再用 `.cn` SNI 重新建连；这是安全敏感功能，未实现。
+- 单纯 SNI 代理不终止 TLS 也改不了 ClientHello 里的 SNI，不能解决这个问题。
+- 本机测试环境直连 `.com` 源站也出现 TLS 握手失败，说明“回源透传”依赖上游网络；请在目标路由器上复测，不能把本机结果当成重庆电信的结论。
+
 ### 为什么 .com 不能直接指到节点
 
 CDN 按 HTTP `Host` 选虚拟主机。国内节点只配置了 `.cn` 名字；`Host: assets1.xboxlive.com` 会命中 `Deny-Reason: hotload no host conf!!`，`Host: xvcf1.xboxlive.cn` 也没有配置。改 DNS、写 hosts 或做 CNAME 都只改 IP，不会改 `Host`，所以必须在这一跳返回 `302`，让主机改用节点认的 `.cn` 名字重新请求。[XboxDownload 的说明](https://github.com/skydevil88/XboxDownload/blob/master/README_OpenWrt.md) 也是这个做法：`.com` 指向路由器上的跳转服务，再 302 到 `.cn`；它的 hosts 方案里 `.com` 只能填 Akamai IP，明确写了不能用 cn IP。
