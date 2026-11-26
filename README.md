@@ -16,7 +16,7 @@ opkg install /tmp/luci-app-xboxaccel_*_all.ipk
 
 这个 ipk 是 gzip 压缩的 tar 包，供使用 opkg 的 OpenWrt / iStoreOS 24.10 安装。依赖 `luci-base`、`curl`、`uhttpd`、`nftables` 和 `kmod-nft-nat`。
 
-1.1.0 及更早的包里没有 302 跳转，`assets1.xboxlive.com` 会被直接写成节点地址，节点返回 `Deny-Reason: hotload no host conf!!`。1.2.0 的源码加了跳转，但仓库此前没有生成 1.2.0 的 ipk；路由器上如果还是旧包，dnsmasq 里不会出现跳转假地址，也不会有 8079 监听。
+1.1.0 及更早的包里没有 302 跳转，`assets1.xboxlive.com` 会被直接写成节点地址，节点返回 `Deny-Reason: hotload no host conf!!`。当前统一打包的 `1.2.0-1` 包含 HTTPS 回源、节点在线列表、IPv6 模式和连接日志；路由器上如果还是旧包，dnsmasq 里不会出现跳转假地址，也不会有 8079 监听。
 
 自己打包时，在仓库根目录执行：
 
@@ -32,7 +32,7 @@ python tools/build_ipk.py
 - `RELEASE` 是打包修订：只改脚本/依赖/权限、不改代码行为时递增；`VERSION` 变化时重置为 `1`。
 - **普通提交不要求改版本。** 构建同一个版本可以反复覆盖产物；只有发布或重新打包时才改 `VERSION`/`RELEASE`。
 - 发布流程：改 `VERSION`/`RELEASE` → 提交 → 打 `v$(cat VERSION)` 标签 → `python tools/build_ipk.py`。
-- 当前版本：`1.4.0-1`。
+- 当前统一打包版本：`1.2.0-1`。**在路由器确认能正常运行前，后续修复继续复用 1.2.0-1，不递增版本号**；确认稳定后再按上面的规则迭代。
 
 `ipk/control` 里的 `Version` 只是给人看的基线；`tools/build_ipk.py` 会用 `VERSION`/`RELEASE` 覆盖它。`Makefile` 同样直接读取这两个文件。
 
