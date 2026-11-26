@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y nftables
+
+      - name: Shell syntax
+        run: |
+          for f in \
+            src/usr/sbin/xboxaccel \
+            src/usr/share/xboxaccel/policy \
+            src/usr/share/xboxaccel/roster \
+            src/usr/share/xboxaccel/redir-run \
+            src/usr/share/xboxaccel/www/cgi-bin/redirect \
+            src/etc/init.d/xboxaccel \
+            src/etc/hotplug.d/iface/99-xboxaccel; do
+            sh -n "$f"
+          done
+
+      - name: Self tests
+        run: sh src/usr/sbin/xboxaccel check
+
+      - name: JavaScript syntax
+        run: node --check src/www/luci-static/resources/view/xboxaccel.js
+
+      - name: Python syntax
+        run: python -m py_compile tools/build_ipk.py
+
+      - name: Build package
+        run: python tools/build_ipk.py
+
+      - name: Validate package
+        run: |
+          python - <<'PY'
+          import io
+          import tarfile
+          from pathlib import Path
+
+          version = (Path("VERSION").read_text().strip())
+          release = (Path("RELEASE").read_text().strip())
+          expected = f"{version}-{release}"
+          package = Path("dist") / f"luci-app-xboxaccel_{expected}_all.ipk"
+          assert package.is_file(), package
+
+          with tarfile.open(package) as outer:
+              control = tarfile.open(
+                  fileobj=io.BytesIO(outer.extractfile("./control.tar.gz").read()),
+                  mode="r:gz",
+              )
+              text = control.extractfile("./control").read().decode()
+              assert f"Version: {expected}" in text, text
+              assert "Depends:" in text
+
+              data = tarfile.open(
+                  fileobj=io.BytesIO(outer.extractfile("./data.tar.gz").read()),
+                  mode="r:gz",
+              )
+              files = {m.name: m for m in data.getmembers() if m.isfile()}
+              for required in (
+                  "./usr/sbin/xboxaccel",
+                  "./usr/share/xboxaccel/www/cgi-bin/redirect",
+                  "./etc/hotplug.d/iface/99-xboxaccel",
+              ):
+                  assert required in files, required
+                  assert files[required].mode & 0o111, required
+          PY
+
+      - name: nft syntax
+        run: |
+          printf 'assets1.xboxlive.com\t198.51.100.1\t23.1.1.1\nxvcf1.xboxlive.cn\t198.51.100.2\t-\n' > /tmp/xboxaccel.map
+          sh src/usr/sbin/xboxaccel nft-preview /tmp/xboxaccel.map > /tmp/xboxaccel.nft
+          sudo nft -c -f /tmp/xboxaccel.nft

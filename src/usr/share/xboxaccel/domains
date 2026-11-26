@@ -11,8 +11,9 @@ d1.xboxlive.cn	primary	cn
 d2.xboxlive.cn	primary	cn
 # xvcf*.xboxlive.cn has no DNS record and no vhost on the domestic nodes.
 # Pinning it to a node returns 403/502, so send it through the 302 as well.
-xvcf1.xboxlive.cn	primary	global
-xvcf2.xboxlive.cn	primary	global
+# It has no public HTTPS origin, hence "alias": HTTP 302 only.
+xvcf1.xboxlive.cn	primary	alias
+xvcf2.xboxlive.cn	primary	alias
 dlassets.xboxlive.com	legacy	global
 dlassets2.xboxlive.com	legacy	global
 dlassets.xboxlive.cn	legacy	cn

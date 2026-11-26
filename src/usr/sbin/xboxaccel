@@ -7,6 +7,10 @@ export PATH="/usr/sbin:/usr/bin:/sbin:/bin:${PATH:-/usr/sbin:/usr/bin:/sbin:/bin
 
 DOMAINS=/usr/share/xboxaccel/domains
 NODES=/usr/share/xboxaccel/nodes.tsv
+NODES_ONLINE=/tmp/xboxaccel.nodes.tsv
+NODES_META=/tmp/xboxaccel.nodes.meta
+NODES_URL_DEFAULT='https://raw.githubusercontent.com/rainforestlin/xbox-accelorate/main/src/usr/share/xboxaccel/nodes.tsv'
+NODES_URL_BACKUP='https://cdn.jsdelivr.net/gh/rainforestlin/xbox-accelorate@main/src/usr/share/xboxaccel/nodes.tsv'
 POLICY=/usr/share/xboxaccel/policy
 ROSTER=/usr/share/xboxaccel/roster
 STATUS=/tmp/xboxaccel.status
@@ -24,15 +28,20 @@ CRON_LINE='*/5 * * * * /usr/sbin/xboxaccel tick # xboxaccel'
 CONF_NAME=xboxaccel.conf
 LOG=/tmp/xboxaccel.log
 CONN_LOG=/tmp/xboxaccel.redirect.log
-# .com names land here and answer HTTP 302. .cn names keep the selected CDN address.
-# 198.18.88.80/32 is added to the LAN bridge; nft sends only that address's port 80 to REDIR_PORT.
-REDIR_IP=198.18.88.80
+# Each redirect host gets its own fake IPv4 alias from REDIR_NET. nft sends
+# port 80 to the local 302 listener and DNATs port 443 to the real origin.
+REDIR_NET_DEFAULT=198.51.100.0/24
+LEGACY_REDIR_IP=198.18.88.80
+REDIR_MARK='# xboxaccel redirect'
 REDIR_PORT=8079
 REDIR_WANT=/tmp/xboxaccel.redir.want
 REDIR_PID=/var/run/xboxaccel.redir.pid
 REDIR_HTTP_PID=/var/run/xboxaccel.uhttpd.pid
 REDIR_DEVS=/tmp/xboxaccel.redir.devs
 REDIR_LOG=/tmp/xboxaccel.redir.log
+REDIR_MAP=/tmp/xboxaccel.redirect.map
+REDIR_ORIGINS=/tmp/xboxaccel.origins
+REFRESH_CRON='17 */6 * * * /usr/sbin/xboxaccel refresh # xboxaccel'
 # The legacy CDN (XboxOne-era cn2 nodes) does not carry /Z/routing/extraextralarge.txt.
 # This is one of the public cn2 sample files used by XboxDownload's speed test.
 LEGACY_SAMPLE=/public/content/0044aef3-bd7e-4478-8782-6191546dcd9a/f6585e19-765c-49c3-ba77-326c3766e05a/1.0.4.0.60281fce-b9c0-49f6-a2b6-027abad22637/ACBF_1.0.4.0_x64__b6krnev7r9sf8
@@ -197,6 +206,356 @@ setting_scheme() {
 	esac
 }
 
+setting_ipv6_mode() {
+	case "$(uci_get ipv6_mode)" in
+		off) printf 'off\n' ;;
+		*) printf 'block\n' ;;
+	esac
+}
+
+setting_redirect_net() {
+	local net
+	net=$(uci_get redirect_net)
+	valid_redirect_net "$net" && printf '%s\n' "$net" || printf '%s\n' "$REDIR_NET_DEFAULT"
+}
+
+valid_redirect_net() {
+	local net="$1" base first
+	echo "$net" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}/24$' || return 1
+	base=${net%/24}
+	valid_ip "$base" || return 1
+	[ "${base##*.}" = "0" ] || return 1
+	first=${base%%.*}
+	[ "$first" -ge 1 ] && [ "$first" -le 223 ] || return 1
+	return 0
+}
+
+redirect_net_overlaps_lan() {
+	local net="$1" base dev
+	base=${net%/24}
+	base=${base%.*}
+	for dev in $(lan_devs 2>/dev/null); do
+		[ -n "$dev" ] || continue
+		ip -4 addr show dev "$dev" 2>/dev/null | awk -v p="$base" '
+			$1 == "inet" {
+				split($2, a, "/")
+				split(a[1], x, ".")
+				split(p, y, ".")
+				if (x[1] == y[1] && x[2] == y[2] && x[3] == y[3]) found = 1
+			}
+			END { exit !found }
+		' && return 0
+	done
+	return 1
+}
+
+setting_origin_ttl() {
+	local n
+	n=$(uci_get origin_ttl)
+	case "$n" in ''|*[!0-9]*) n=21600 ;; esac
+	[ "$n" -lt 300 ] && n=300
+	[ "$n" -gt 604800 ] && n=604800
+	printf '%s\n' "$n"
+}
+
+setting_nodes_url() {
+	local url
+	url=$(uci_get nodes_url)
+	printf '%s\n' "${url:-$NODES_URL_DEFAULT}"
+}
+
+setting_nodes_backup() {
+	local url
+	url=$(uci_get nodes_url_backup)
+	printf '%s\n' "${url:-$NODES_URL_BACKUP}"
+}
+
+nodes_file() {
+	if [ -s "$NODES_ONLINE" ]; then
+		printf '%s\n' "$NODES_ONLINE"
+	else
+		printf '%s\n' "$NODES"
+	fi
+}
+
+node_row() {
+	awk -F '\t' -v ip="$1" '$1 == ip { print $2 "\t" $3 "\t" $4; exit }' "$(nodes_file)"
+}
+
+nodes_validate() {
+	awk -F '\t' -v domains="$DOMAINS" '
+		function validip(ip, a, n, i) {
+			if (ip !~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) return 0
+			n = split(ip, a, ".")
+			if (n != 4) return 0
+			for (i = 1; i <= 4; i++) {
+				if (a[i] ~ /^0[0-9]/ || a[i] + 0 > 255) return 0
+			}
+			if (a[1] == 0 || a[1] == 10 || a[1] == 127 || a[1] == 255) return 0
+			if (a[1] == 169 && a[2] == 254) return 0
+			if (a[1] == 192 && a[2] == 168) return 0
+			if (a[1] == 172 && a[2] >= 16 && a[2] <= 31) return 0
+			if (a[1] == 100 && a[2] >= 64 && a[2] <= 127) return 0
+			if (a[1] >= 224) return 0
+			return 1
+		}
+		BEGIN {
+			while ((getline line < domains) > 0) {
+				split(line, a, "\t")
+				if (a[1] != "" && a[1] !~ /^#/) okhost[a[1]] = 1
+			}
+		}
+		{
+			if ($0 == "" || $1 ~ /^#/) next
+			if (NF < 4) { bad++; next }
+			ip = $1
+			gsub(/^[ \t]+|[ \t]+$/, "", ip)
+			host = $3
+			gsub(/^[ \t]+|[ \t]+$/, "", host)
+			group = $4
+			gsub(/^[ \t]+|[ \t]+$/, "", group)
+			if (!validip(ip) || !(host in okhost) || (group != "cn1" && group != "cn2") || $2 == "") {
+				bad++
+				next
+			}
+			if (seen[ip]++) next
+			print ip "\t" $2 "\t" host "\t" group
+			good++
+		}
+		END {
+			if (good < 10 || bad > good) exit 1
+		}
+	' "$1"
+}
+
+nodes_update() {
+	local arg="$1" url backup tmp valid sha meta now good
+	url=${arg:-$(setting_nodes_url)}
+	backup=$(setting_nodes_backup)
+	tmp=$(mktemp) || return 1
+	valid=$(mktemp) || { rm -f "$tmp"; return 1; }
+	meta=$(mktemp) || { rm -f "$tmp" "$valid"; return 1; }
+	if ! curl -q -fsS --proto '=https' --tlsv1.2 --max-time 8 --max-filesize 524288 \
+		-H 'Cache-Control: no-cache' -o "$tmp" "$url"; then
+		if ! curl -q -fsS --proto '=https' --tlsv1.2 --max-time 8 --max-filesize 524288 \
+			-H 'Cache-Control: no-cache' -o "$tmp" "$backup"; then
+			log "节点列表下载失败"
+			rm -f "$tmp" "$valid" "$meta"
+			return 1
+		fi
+		url=$backup
+	fi
+	if ! nodes_validate "$tmp" > "$valid"; then
+		log "节点列表格式校验失败"
+		rm -f "$tmp" "$valid" "$meta"
+		return 1
+	fi
+	sha=$(uci_get nodes_sha256)
+	if [ -n "$sha" ]; then
+		good=$(sha256sum "$tmp" | awk '{ print $1 }')
+		if [ "$good" != "$sha" ]; then
+			log "节点列表校验和不匹配"
+			rm -f "$tmp" "$valid" "$meta"
+			return 1
+		fi
+	fi
+	good=$(awk 'END { print NR + 0 }' "$valid")
+	now=$(date +%s)
+	mv "$valid" "$NODES_ONLINE" || { rm -f "$tmp" "$valid" "$meta"; return 1; }
+	printf '%s\t%s\t%s\t%s\n' "$now" "$url" "$good" "${sha:-none}" > "$meta"
+	mv "$meta" "$NODES_META"
+	rm -f "$tmp"
+	log "节点列表已更新：${good} 条（${url}）"
+	return 0
+}
+
+cmd_nodes_update() {
+	exec 9>"$LOCK"
+	flock -n 9 || {
+		echo busy
+		exit 0
+	}
+	if nodes_update "$1"; then
+		nodes_status
+	else
+		echo failed
+		exit 1
+	fi
+}
+
+cmd_nodes_status() {
+	if [ -s "$NODES_ONLINE" ] && [ -s "$NODES_META" ]; then
+		IFS="$(printf '\t')" read -r ts url count sha < "$NODES_META"
+		printf 'source\tcache\nupdated\t%s\nurl\t%s\ncount\t%s\nsha\t%s\n' \
+			"$(date -d "@${ts:-0}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo "$ts")" "$url" "$count" "$sha"
+	else
+		printf 'source\tbuiltin\nupdated\t\nurl\t%s\ncount\t%s\nsha\tnone\n' \
+			"$(setting_nodes_url)" "$(awk 'END { print NR + 0 }' "$NODES" 2>/dev/null)"
+	fi
+}
+
+cmd_nodes_clear() {
+	rm -f "$NODES_ONLINE" "$NODES_META"
+	log "已恢复内置节点列表"
+}
+
+nodes_status() {
+	cmd_nodes_status
+}
+
+
+origin_resolvers() {
+	{
+		printf '%s\n' $(uci_get origin_dns | tr ',' ' ')
+		if [ -r /tmp/resolv.conf.d/resolv.conf.auto ]; then
+			awk '/^nameserver / { print $2 }' /tmp/resolv.conf.d/resolv.conf.auto
+		fi
+		printf '%s\n' 223.5.5.5 119.29.29.29 1.1.1.1
+	} | awk 'NF && $0 !~ /^127\./ && $0 !~ /:/ && !seen[$0]++'
+}
+
+usable_origin_ipv4() {
+	local net base
+	public_ipv4 "$1" || return 1
+	case "$1" in
+		198.18.*|198.19.*|192.0.2.*|198.51.100.*|203.0.113.*) return 1 ;;
+	esac
+	net=${REDIR_NET_CURRENT:-$(setting_redirect_net)}
+	base=${net%/24}
+	base=${base%.*}
+	case "$1" in
+		"${base}."*) return 1 ;;
+	esac
+	return 0
+}
+
+origin_lookup() {
+	local host="$1" server="$2" ip
+	dns_lookup a "$host" "$server"
+	awk '/^Server:/ { srv = 1; next }
+		/^Addresses:/ { if (srv) { srv = 0; next } print $2; plural = 1; next }
+		/^Address:/ { if (srv) { srv = 0; next } print $2; plural = 0; next }
+		/^[ \t]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/ { if (plural) print $1 }' /tmp/xboxaccel.lookup |
+	while IFS= read -r ip; do
+		usable_origin_ipv4 "$ip" && {
+			printf '%s\n' "$ip"
+			break
+		}
+	done
+}
+
+cache_origin() {
+	local host="$1" origin="$2" now="$3" tmp
+	tmp=$(mktemp) || return 1
+	if [ -f "$REDIR_ORIGINS" ]; then
+		awk -F '\t' -v h="$host" '$1 != h' "$REDIR_ORIGINS" > "$tmp"
+	fi
+	printf '%s\t%s\t%s\n' "$host" "$origin" "$now" >> "$tmp"
+	mv "$tmp" "$REDIR_ORIGINS"
+}
+
+resolve_origin() {
+	local host="$1" now ts old origin server
+	now=$(date +%s)
+	ts=
+	old=
+	if [ -s "$REDIR_ORIGINS" ]; then
+		while IFS="$(printf '\t')" read -r h o t; do
+			[ "$h" = "$host" ] || continue
+			old=$o
+			ts=$t
+			break
+		done < "$REDIR_ORIGINS"
+	fi
+	if [ -n "$old" ] && [ -n "$ts" ] && [ $((now - ts)) -lt "$(setting_origin_ttl)" ]; then
+		printf '%s\n' "$old"
+		return 0
+	fi
+	for server in $(origin_resolvers); do
+		origin=$(origin_lookup "$host" "$server")
+		[ -n "$origin" ] && break
+	done
+	if [ -n "$origin" ]; then
+		cache_origin "$host" "$origin" "$now"
+		printf '%s\n' "$origin"
+		return 0
+	fi
+	if [ -n "$old" ]; then
+		cache_origin "$host" "$old" "$now"
+		printf '%s\n' "$old"
+		return 0
+	fi
+	return 1
+}
+
+redirect_map_alias() {
+	awk -F '\t' -v h="$1" '$1 == h { print $2; exit }' "$REDIR_MAP" 2>/dev/null
+}
+
+build_redirect_map() {
+	local primary="$1" legacy="$2" pin="$3"
+	local net base host pool edge extra ip origin alias n=0 https=0 missing=0 tmp
+	[ "$pin" = 1 ] || return 1
+	net=$(setting_redirect_net)
+	valid_redirect_net "$net" || {
+		log "跳转地址段无效：$net"
+		return 1
+	}
+	if redirect_net_overlaps_lan "$net"; then
+		log "跳转地址段和局域网重叠：$net"
+		return 1
+	fi
+	base=${net%/24}
+	base=${base%.*}
+	REDIR_NET_CURRENT=$net
+	log "正在解析跳转源站（${net}）"
+	tmp=$(mktemp) || return 1
+	while IFS="$(printf '\t')" read -r host pool edge extra; do
+		case "$host" in
+			''|'#'*) continue ;;
+		esac
+		case "$edge" in
+			global|hop|alias) ;;
+			*) continue ;;
+		esac
+		case "$pool" in
+			primary) ip=$primary ;;
+			legacy) ip=$legacy ;;
+			*) continue ;;
+		esac
+		public_ipv4 "$ip" || continue
+		if [ "$edge" = alias ]; then
+			origin=-
+		else
+			origin=$(resolve_origin "$host")
+			if [ -z "$origin" ]; then
+				missing=$((missing + 1))
+				log "源站解析失败，跳过 $host"
+				continue
+			fi
+		fi
+		n=$((n + 1))
+		if [ "$n" -gt 254 ]; then
+			log "跳转别名超过 254 个，跳过剩余 host"
+			break
+		fi
+		alias="${base}.${n}"
+		printf '%s\t%s\t%s\n' "$host" "$alias" "$origin" >> "$tmp"
+		[ "$origin" = "-" ] || https=$((https + 1))
+	done < "$DOMAINS"
+	if [ ! -s "$tmp" ]; then
+		rm -f "$tmp"
+		log "没有可用的跳转 host"
+		return 1
+	fi
+	mv "$tmp" "$REDIR_MAP"
+	REDIRECT_NET_ACTIVE=$net
+	ORIGIN_COUNT=$https
+	ORIGIN_MISSING=$missing
+	log "跳转映射：${n} 个 host，${https} 个 HTTPS 回源，${missing} 个源站解析失败"
+	return 0
+}
+
 setting_primary() {
 	local value
 	if has_opt primary_ip; then
@@ -336,6 +695,38 @@ migrate_uci() {
 		uci set xboxaccel.main.pin_global='1'
 		dirty=1
 	fi
+	if ! has_opt redirect_net; then
+		uci set "xboxaccel.main.redirect_net=$REDIR_NET_DEFAULT"
+		dirty=1
+	fi
+	if ! has_opt origin_dns; then
+		uci set xboxaccel.main.origin_dns=''
+		dirty=1
+	fi
+	if ! has_opt origin_ttl; then
+		uci set xboxaccel.main.origin_ttl='21600'
+		dirty=1
+	fi
+	if ! has_opt nodes_url; then
+		uci set "xboxaccel.main.nodes_url=$NODES_URL_DEFAULT"
+		dirty=1
+	fi
+	if ! has_opt nodes_url_backup; then
+		uci set "xboxaccel.main.nodes_url_backup=$NODES_URL_BACKUP"
+		dirty=1
+	fi
+	if ! has_opt nodes_sha256; then
+		uci set xboxaccel.main.nodes_sha256=''
+		dirty=1
+	fi
+	if ! has_opt nodes_update_hours; then
+		uci set xboxaccel.main.nodes_update_hours='24'
+		dirty=1
+	fi
+	if ! has_opt ipv6_mode; then
+		uci set xboxaccel.main.ipv6_mode='block'
+		dirty=1
+	fi
 	[ "$dirty" = 1 ] && uci commit xboxaccel
 }
 
@@ -355,11 +746,13 @@ stale() {
 install_cron() {
 	mkdir -p /etc/crontabs
 	[ -f "$CRON_FILE" ] || touch "$CRON_FILE"
-	if grep -Fxq "$CRON_LINE" "$CRON_FILE" 2>/dev/null; then
+	if grep -Fxq "$CRON_LINE" "$CRON_FILE" 2>/dev/null &&
+		grep -Fxq "$REFRESH_CRON" "$CRON_FILE" 2>/dev/null; then
 		return 0
 	fi
 	grep -v '# xboxaccel$' "$CRON_FILE" > "${CRON_FILE}.xboxaccel" || true
 	echo "$CRON_LINE" >> "${CRON_FILE}.xboxaccel"
+	echo "$REFRESH_CRON" >> "${CRON_FILE}.xboxaccel"
 	mv "${CRON_FILE}.xboxaccel" "$CRON_FILE"
 	/etc/init.d/cron restart >/dev/null 2>&1 || true
 }
@@ -373,8 +766,8 @@ remove_cron() {
 }
 
 dns_lookup() {
-	local pid i=0
-	nslookup -type="$1" "$2" 127.0.0.1 >/tmp/xboxaccel.lookup 2>&1 &
+	local type="$1" host="$2" server="${3:-127.0.0.1}" pid i=0
+	nslookup -type="$type" "$host" "$server" >/tmp/xboxaccel.lookup 2>&1 &
 	pid=$!
 	while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 3 ]; do
 		sleep 1
@@ -431,7 +824,7 @@ verify_published() {
 }
 
 redirect_in() {
-	grep -q "/${REDIR_IP}$" "$1" 2>/dev/null
+	grep -qxF "$REDIR_MARK" "$1" 2>/dev/null
 }
 
 share_dir() {
@@ -503,68 +896,92 @@ lan_devs() {
 	rm -f "$seen"
 }
 
-ensure_addrs() {
-	local dev ok=0 list
-	list=$(mktemp) || return 1
-	lan_devs > "$list" || { rm -f "$list"; return 1; }
-	if [ ! -s "$list" ]; then
-		rm -f "$list"
-		log "没有找到局域网接口，无法跳转"
-		return 1
-	fi
-	if [ -f "$REDIR_DEVS" ]; then
-		while IFS= read -r dev; do
-			[ -n "$dev" ] || continue
-			grep -qxF -- "$dev" "$list" && continue
-			ip addr del "${REDIR_IP}/32" dev "$dev" 2>/dev/null || true
-		done < "$REDIR_DEVS"
-	fi
-	while IFS= read -r dev; do
-		[ -n "$dev" ] || continue
-		if ip addr add "${REDIR_IP}/32" dev "$dev" 2>/dev/null || ip addr show dev "$dev" 2>/dev/null | grep -q "$REDIR_IP"; then
-			ok=1
-		else
-			log "没能把跳转地址加到 ${dev}"
-		fi
-	done < "$list"
-	mv "$list" "$REDIR_DEVS"
-	[ "$ok" = 1 ]
+nft_rules() {
+	awk -F '\t' -v port="$REDIR_PORT" '
+		BEGIN { n = 0; m = 0 }
+		{
+			a[n++] = $2
+			if ($3 != "-" && $3 != "") {
+				h[m] = $2
+				o[m] = $3
+				m++
+			}
+		}
+		END {
+			if (n == 0) exit 1
+			print "table inet xboxaccel {"
+			printf " set redirect_v4 { type ipv4_addr; elements = { "
+			for (i = 0; i < n; i++)
+				printf "%s%s", (i ? ", " : ""), a[i]
+			print " } }"
+			if (m > 0) {
+				printf " map https4 { type ipv4_addr : ipv4_addr; elements = { "
+				for (i = 0; i < m; i++)
+					printf "%s%s : %s", (i ? ", " : ""), h[i], o[i]
+				print " } }"
+			}
+			print " chain prerouting {"
+			print "  type nat hook prerouting priority dstnat; policy accept;"
+			print "  ip daddr @redirect_v4 tcp dport 80 redirect to :" port
+			if (m > 0)
+				print "  ip daddr @redirect_v4 tcp dport 443 dnat to ip daddr map @https4"
+			print " }"
+			print " chain output {"
+			print "  type nat hook output priority -100; policy accept;"
+			print "  ip daddr @redirect_v4 tcp dport 80 redirect to :" port
+			if (m > 0)
+				print "  ip daddr @redirect_v4 tcp dport 443 dnat to ip daddr map @https4"
+			print " }"
+			print "}"
+		}
+	' "$REDIR_MAP"
 }
 
 ensure_nft() {
-	local tmp
+	local tmp create apply
 	command -v nft >/dev/null 2>&1 || {
-		log "没有 nft，无法把 80 端口转到跳转服务"
+		log "没有 nft，无法建立跳转规则"
+		return 1
+	}
+	[ -s "$REDIR_MAP" ] || {
+		log "没有跳转映射"
 		return 1
 	}
 	tmp=$(mktemp) || return 1
-	cat > "$tmp" <<EOF
-delete table inet xboxaccel
-table inet xboxaccel {
-	chain prerouting {
-		type nat hook prerouting priority dstnat; policy accept;
-		ip daddr ${REDIR_IP} tcp dport 80 redirect to :${REDIR_PORT}
+	create=$(mktemp) || { rm -f "$tmp"; return 1; }
+	apply=$(mktemp) || { rm -f "$tmp" "$create"; return 1; }
+	nft_rules > "$tmp" || {
+		log "跳转规则生成失败"
+		rm -f "$tmp" "$create" "$apply"
+		return 1
 	}
-	chain output {
-		type nat hook output priority dstnat; policy accept;
-		ip daddr ${REDIR_IP} tcp dport 80 redirect to :${REDIR_PORT}
-	}
-}
+	cat "$tmp" > "$create"
+	{
+		echo 'delete table inet xboxaccel'
+		cat "$create"
+	} > "$apply"
+	if ! nft list table inet xboxaccel >/dev/null 2>&1; then
+		if ! nft -c -f "$create" >/tmp/xboxaccel.nft.log 2>&1; then
+			log "跳转规则校验失败"
+			while IFS= read -r line; do log "nft: $line"; done <<EOF
+$(tail -n 5 /tmp/xboxaccel.nft.log 2>/dev/null)
 EOF
-	# The delete fails when the table is absent. Load the table either way.
-	nft -f "$tmp" >/tmp/xboxaccel.nft.log 2>&1 || nft -f - >>/tmp/xboxaccel.nft.log 2>&1 <<EOF
-table inet xboxaccel {
-	chain prerouting {
-		type nat hook prerouting priority dstnat; policy accept;
-		ip daddr ${REDIR_IP} tcp dport 80 redirect to :${REDIR_PORT}
-	}
-	chain output {
-		type nat hook output priority dstnat; policy accept;
-		ip daddr ${REDIR_IP} tcp dport 80 redirect to :${REDIR_PORT}
-	}
-}
+			rm -f "$tmp" "$create" "$apply"
+			return 1
+		fi
+	fi
+	if ! nft -f "$apply" >/tmp/xboxaccel.nft.log 2>&1; then
+		# The delete fails when the table is absent; create it instead.
+		if ! nft -f "$create" >>/tmp/xboxaccel.nft.log 2>&1; then
+			log "跳转规则应用失败"
+			while IFS= read -r line; do log "nft: $line"; done <<EOF
+$(tail -n 5 /tmp/xboxaccel.nft.log 2>/dev/null)
 EOF
-	rm -f "$tmp"
+			rm -f "$tmp" "$create" "$apply"
+			return 1
+		fi
+	fi
+	rm -f "$tmp" "$create" "$apply"
 	nft list table inet xboxaccel >/dev/null 2>&1
 }
 
@@ -622,7 +1039,7 @@ EOF
 setup_redirect() {
 	local was=0
 	redirect_healthy && was=1
-	if ! ensure_addrs || ! ensure_nft || ! ensure_http; then
+	if ! ensure_nft || ! ensure_http; then
 		return 1
 	fi
 	if [ "$was" != 1 ]; then
@@ -639,13 +1056,18 @@ teardown_redirect() {
 	nft list table inet xboxaccel >/dev/null 2>&1 && had=1
 	stop_redirect_procs
 	nft delete table inet xboxaccel >/dev/null 2>&1 || true
+	# Remove the pre-1.4 single alias if an upgrade left it behind.
 	if [ -f "$REDIR_DEVS" ]; then
 		while IFS= read -r dev; do
 			[ -n "$dev" ] || continue
-			ip addr del "${REDIR_IP}/32" dev "$dev" 2>/dev/null || true
+			ip addr del "${LEGACY_REDIR_IP}/32" dev "$dev" 2>/dev/null || true
 		done < "$REDIR_DEVS"
 		rm -f "$REDIR_DEVS"
 	fi
+	for dev in $(lan_devs 2>/dev/null); do
+		[ -n "$dev" ] || continue
+		ip addr del "${LEGACY_REDIR_IP}/32" dev "$dev" 2>/dev/null || true
+	done
 	if [ "$had" = 1 ]; then
 		log "国际域名跳转已停止"
 	fi
@@ -663,9 +1085,10 @@ finish_redirect() {
 
 render_dns() {
 	local primary="$1" legacy="$2" pin="$3" dest="$4"
-	local host pool edge ip have_primary=0 have_legacy=0 srv
+	local host pool edge ip have_primary=0 have_legacy=0 srv map_ip redirect=0 ipv6_mode
 	public_ipv4 "$primary" && have_primary=1
 	public_ipv4 "$legacy" && have_legacy=1
+	ipv6_mode=$(setting_ipv6_mode)
 	: > "$dest"
 	echo '# generated by xboxaccel' >> "$dest"
 	while IFS="$(printf '\t')" read -r host pool edge extra; do
@@ -681,23 +1104,27 @@ render_dns() {
 				esac
 				public_ipv4 "$ip" || continue
 				;;
-			global|hop)
+			global|hop|alias)
 				# Domestic nodes reject Host: *.xboxlive.com and have no vhost for
-				# xvcf*.xboxlive.cn. Send both to the local redirector, which answers
-				# 302 to a .cn name the node accepts.
+				# xvcf*.xboxlive.cn. These names get a per-host fake alias; nft
+				# sends 80 to the 302 listener and 443 to the real origin.
 				[ "$pin" = 1 ] || continue
 				case "$pool" in
 					primary) [ "$have_primary" = 1 ] || continue ;;
 					legacy) [ "$have_legacy" = 1 ] || continue ;;
 					*) continue ;;
 				esac
-				ip=$REDIR_IP
+				map_ip=$(redirect_map_alias "$host")
+				[ -n "$map_ip" ] || continue
+				ip=$map_ip
+				redirect=1
 				;;
 			*) continue ;;
 		esac
-		printf 'local=/%s/\n' "$host" >> "$dest"
+		[ "$ipv6_mode" = block ] && printf 'local=/%s/\n' "$host" >> "$dest"
 		printf 'address=/%s/%s\n' "$host" "$ip" >> "$dest"
 	done < "$DOMAINS"
+	[ "$redirect" = 1 ] && printf '%s\n' "$REDIR_MARK" >> "$dest"
 	# Xbox asks assets-srvs for a spare CDN and then connects with Host: assets1.xboxlive.com.
 	# Point that SRV at the name we already redirect.
 	if [ "$pin" = 1 ] && [ "$have_primary" = 1 ]; then
@@ -707,7 +1134,7 @@ render_dns() {
 			assets-srvs-apac.delivery.microsoft.com \
 			assets-srvs-na.delivery.microsoft.com
 		do
-			printf 'local=/%s/\n' "$srv" >> "$dest"
+			[ "$ipv6_mode" = block ] && printf 'local=/%s/\n' "$srv" >> "$dest"
 			printf 'srv-host=%s,assets1.xboxlive.com,80,0,0\n' "$srv" >> "$dest"
 		done
 	fi
@@ -720,6 +1147,12 @@ publish() {
 	dest="$dir/$CONF_NAME"
 	rm -f "$dir/xboxaccel.conf.bak" "$dir/xboxaccel.conf.mark" "$dir/xboxaccel.conf.retract"
 	tmp=$(mktemp) || return 1
+	if [ "$(setting_pin)" = 1 ] && { public_ipv4 "$primary" || public_ipv4 "$legacy"; }; then
+		if ! build_redirect_map "$primary" "$legacy" 1; then
+			rm -f "$REDIR_MAP"
+			log "跳转映射没有建立，.com 保持原来的解析"
+		fi
+	fi
 	render_dns "$primary" "$legacy" "$(setting_pin)" "$tmp"
 	if redirect_in "$tmp"; then
 		if ! setup_redirect; then
@@ -814,13 +1247,14 @@ catalog_has() {
 }
 
 build_catalog() {
-	local skip ip loc host group en name pool
+	local skip ip loc host group en name pool list
+	list=$(nodes_file)
 	skip=$(mktemp) || return 1
 	: > "$CATALOG"
 	list_candidates | while IFS="$(printf '\t')" read -r ip en name pool; do
 		[ "$en" = "0" ] && printf '%s\n' "$ip"
 	done > "$skip"
-	if [ -f "$NODES" ]; then
+	if [ -f "$list" ]; then
 		while IFS="$(printf '\t')" read -r ip loc host group; do
 			case "$ip" in
 				''|'#'*) continue ;;
@@ -829,7 +1263,7 @@ build_catalog() {
 			en=1
 			grep -qxF -- "$ip" "$skip" && en=0
 			printf '%s\t%s\t%s\t%s\t%s\n' "$ip" "$loc" "$host" "$group" "$en" >> "$CATALOG"
-		done < "$NODES"
+		done < "$list"
 	fi
 	list_candidates | while IFS="$(printf '\t')" read -r ip en name pool; do
 		[ "$en" = "0" ] && continue
@@ -1065,6 +1499,10 @@ write_status() {
 	json_add_string carrier "${CARRIER:-$(setting_carrier)}"
 	json_add_string sweep "${SWEEP:-}"
 	json_add_string probe_scheme "${SCHEME:-$(setting_scheme)}"
+	json_add_string redirect_net "${REDIRECT_NET_ACTIVE:-$(setting_redirect_net)}"
+	json_add_int origin_count "${ORIGIN_COUNT:-0}"
+	json_add_int origin_missing "${ORIGIN_MISSING:-0}"
+	json_add_string ipv6_mode "$(setting_ipv6_mode)"
 	json_add_string probe_ip "${PROBE_IP:-}"
 	json_add_int probe_bytes "${PROBE_BYTES:-0}"
 	json_add_int probe_bps "${PROBE_BPS:-0}"
@@ -1399,7 +1837,7 @@ cmd_apply() {
 		return 0
 	fi
 	if [ "$mode" = static ]; then
-		remove_cron
+		install_cron
 		load_static_view
 		if ! publish "$PRIMARY" "$LEGACY"; then
 			PRIMARY_REASON=dns-failed
@@ -1470,7 +1908,7 @@ cmd_use() {
 		uci set "xboxaccel.main.active_legacy=$ip"
 	fi
 	uci commit xboxaccel
-	remove_cron
+	install_cron
 	load_static_view
 	if ! publish "$PRIMARY" "$LEGACY"; then
 		PRIMARY_REASON=dns-failed
@@ -1603,7 +2041,7 @@ restore_view() {
 }
 
 cmd_probe() {
-	local ip="$1" scheme="$2" loc host group limit pool path maxtime
+	local ip="$1" scheme="$2" loc host group limit pool path maxtime list
 	public_ipv4 "$ip" || {
 		echo "这个地址不是公网 IPv4" >&2
 		exit 1
@@ -1653,9 +2091,10 @@ cmd_probe() {
 	else
 		log "开始单点测速 $ip（.cn 直连）"
 	fi
-	loc=$(awk -F '\t' -v ip="$ip" '$1 == ip { print $2; exit }' "$NODES")
-	host=$(awk -F '\t' -v ip="$ip" '$1 == ip { print $3; exit }' "$NODES")
-	group=$(awk -F '\t' -v ip="$ip" '$1 == ip { print $4; exit }' "$NODES")
+	list=$(nodes_file)
+	loc=$(awk -F '\t' -v ip="$ip" '$1 == ip { print $2; exit }' "$list")
+	host=$(awk -F '\t' -v ip="$ip" '$1 == ip { print $3; exit }' "$list")
+	group=$(awk -F '\t' -v ip="$ip" '$1 == ip { print $4; exit }' "$list")
 	pool=primary
 	case "$group" in
 		cn2|manual-legacy) pool=legacy ;;
@@ -1721,6 +2160,39 @@ cmd_stop() {
 	echo stopped
 }
 
+cmd_refresh() {
+	local p l old old_alias new_alias changed=0
+	exec 9>"$LOCK"
+	flock -n 9 || exit 0
+	enabled || exit 0
+	[ "$(setting_pin)" = 1 ] || exit 0
+	p=$(setting_active_primary)
+	l=$(setting_active_legacy)
+	{ public_ipv4 "$p" || public_ipv4 "$l"; } || exit 0
+	old=$(mktemp) || exit 1
+	old_alias=$(mktemp) || { rm -f "$old"; exit 1; }
+	new_alias=$(mktemp) || { rm -f "$old" "$old_alias"; exit 1; }
+	if [ -s "$REDIR_MAP" ]; then
+		cp -f "$REDIR_MAP" "$old"
+		awk -F '\t' '{ print $1 "\t" $2 }' "$old" > "$old_alias"
+	fi
+	if ! build_redirect_map "$p" "$l" 1; then
+		rm -f "$old" "$old_alias" "$new_alias"
+		exit 0
+	fi
+	awk -F '\t' '{ print $1 "\t" $2 }' "$REDIR_MAP" > "$new_alias"
+	cmp -s "$old_alias" "$new_alias" || changed=1
+	rm -f "$old" "$old_alias" "$new_alias"
+	if [ "$changed" = 1 ]; then
+		publish "$p" "$l"
+	else
+		ensure_nft || {
+			log "源站刷新后 nft 重建失败"
+			exit 1
+		}
+	fi
+}
+
 cmd_repair() {
 	local dir dest
 	exec 9>"$LOCK"
@@ -1730,6 +2202,7 @@ cmd_repair() {
 	dest="$dir/$CONF_NAME"
 	[ -f "$dest" ] || exit 0
 	redirect_in "$dest" || exit 0
+	build_redirect_map "$(setting_active_primary)" "$(setting_active_legacy)" 1 || true
 	setup_redirect
 }
 
@@ -1779,7 +2252,20 @@ cmd_preview() {
 	local primary="$1" legacy="$2"
 	[ -n "$primary" ] || primary=$(setting_primary)
 	[ -n "$legacy" ] || legacy=$(setting_legacy)
+	if [ "$(setting_pin)" = 1 ] && { public_ipv4 "$primary" || public_ipv4 "$legacy"; }; then
+		build_redirect_map "$primary" "$legacy" 1 || true
+	fi
 	render_dns "$primary" "$legacy" "$(setting_pin)" /dev/stdout
+}
+
+cmd_nft_preview() {
+	local map="${1:-$REDIR_MAP}"
+	[ -s "$map" ] || {
+		echo "no redirect map" >&2
+		exit 1
+	}
+	REDIR_MAP=$map
+	nft_rules
 }
 
 expect_redirect() {
@@ -1820,42 +2306,88 @@ redirect_selftest() {
 	out=$(HTTP_HOST="$(printf 'assets1.xboxlive.com\r\nX: y')" REQUEST_URI="$(printf '/ok\r\nX: 1')" /bin/sh "$script") || return 1
 	printf '%s\n' "$out" | grep -q '400' || return 1
 	tmp=$(mktemp) || return 1
+	map=$(mktemp) || { rm -f "$tmp"; return 1; }
+	dom=$(mktemp) || { rm -f "$tmp" "$map"; return 1; }
+	map2=$(mktemp) || { rm -f "$tmp" "$map" "$dom"; return 1; }
+	origins=$(mktemp) || { rm -f "$tmp" "$map" "$dom" "$map2"; return 1; }
 	old=$DOMAINS
+	old_map=$REDIR_MAP
+	old_origins=$REDIR_ORIGINS
 	DOMAINS="$share/domains"
-	render_dns 219.152.87.113 '' 1 "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
-	grep -q '^address=/assets1.xboxlive.cn/219.152.87.113$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
-	grep -q '^address=/assets1.xboxlive.com/198.18.88.80$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
-	grep -q '^address=/xvcf2.xboxlive.com/198.18.88.80$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
-	grep -q '^address=/xvcf2.xboxlive.cn/198.18.88.80$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
-	grep -q '^address=/5.xb.delivery.microsoft.com/198.18.88.80$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
-	grep -q '^srv-host=assets-srvs-net.trafficmanager.net,assets1.xboxlive.com,80,0,0$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	cat > "$map" <<'EOF'
+assets1.xboxlive.com	198.51.100.1	23.1.1.1
+assets2.xboxlive.com	198.51.100.2	23.1.1.2
+d1.xboxlive.com	198.51.100.3	23.1.1.3
+d2.xboxlive.com	198.51.100.4	23.1.1.4
+xvcf1.xboxlive.com	198.51.100.5	23.1.1.5
+xvcf2.xboxlive.com	198.51.100.6	23.1.1.6
+xvcf1.xboxlive.cn	198.51.100.7	-
+xvcf2.xboxlive.cn	198.51.100.8	-
+dlassets.xboxlive.com	198.51.100.9	23.1.1.9
+dlassets2.xboxlive.com	198.51.100.10	23.1.1.10
+5.xb.delivery.microsoft.com	198.51.100.11	23.1.1.11
+assets1.xboxlive.com.edgesuite.net	198.51.100.12	23.1.1.12
+cl-glcb907925.gcdn.co	198.51.100.13	23.1.1.13
+fg.microsoft.map.fastly.net	198.51.100.14	23.1.1.14
+EOF
+	REDIR_MAP=$map
+	render_dns 219.152.87.113 '' 1 "$tmp" || { DOMAINS=$old; REDIR_MAP=$old_map; rm -f "$tmp" "$map" "$dom"; return 1; }
+	grep -q '^address=/assets1.xboxlive.cn/219.152.87.113$' "$tmp" || { DOMAINS=$old; REDIR_MAP=$old_map; rm -f "$tmp" "$map" "$dom"; return 1; }
+	grep -q '^address=/assets1.xboxlive.com/198.51.100.1$' "$tmp" || { DOMAINS=$old; REDIR_MAP=$old_map; rm -f "$tmp" "$map" "$dom"; return 1; }
+	grep -q '^address=/xvcf2.xboxlive.cn/198.51.100.8$' "$tmp" || { DOMAINS=$old; REDIR_MAP=$old_map; rm -f "$tmp" "$map" "$dom"; return 1; }
+	grep -q '^address=/5.xb.delivery.microsoft.com/198.51.100.11$' "$tmp" || { DOMAINS=$old; REDIR_MAP=$old_map; rm -f "$tmp" "$map" "$dom"; return 1; }
+	grep -qxF "$REDIR_MARK" "$tmp" || { DOMAINS=$old; REDIR_MAP=$old_map; rm -f "$tmp" "$map" "$dom"; return 1; }
+	grep -q '^srv-host=assets-srvs-net.trafficmanager.net,assets1.xboxlive.com,80,0,0$' "$tmp" || { DOMAINS=$old; REDIR_MAP=$old_map; rm -f "$tmp" "$map" "$dom"; return 1; }
 	if grep -q '^address=/assets1.xboxlive.com/219.152.87.113$' "$tmp" ||
 		grep -q '^address=/xvcf[12]\.xboxlive\.cn/219.152.87.113$' "$tmp" ||
 		grep -q 'dlassets.xboxlive.com' "$tmp"; then
 		DOMAINS=$old
-		rm -f "$tmp"
+		REDIR_MAP=$old_map
+		rm -f "$tmp" "$map" "$dom"
 		echo "com and xvcf.cn must not share the cdn address" >&2
 		return 1
 	fi
-	render_dns 219.152.87.113 '' 0 "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
-	if grep -q 'xboxlive.com/' "$tmp" || grep -q 'xvcf[12]\.xboxlive\.cn' "$tmp" || grep -q '^srv-host=' "$tmp"; then
+	render_dns 219.152.87.113 '' 0 "$tmp" || { DOMAINS=$old; REDIR_MAP=$old_map; rm -f "$tmp" "$map" "$dom"; return 1; }
+	if grep -qxF "$REDIR_MARK" "$tmp" || grep -q 'xboxlive.com/' "$tmp" || grep -q 'xvcf[12]\.xboxlive\.cn' "$tmp" || grep -q '^srv-host=' "$tmp"; then
 		DOMAINS=$old
-		rm -f "$tmp"
+		REDIR_MAP=$old_map
+		rm -f "$tmp" "$map" "$dom"
 		echo "pin off still rewrote redirected names" >&2
 		return 1
 	fi
-	grep -q '^address=/assets1.xboxlive.cn/219.152.87.113$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
-	render_dns '' 203.0.113.10 1 "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
-	grep -q '^address=/dlassets.xboxlive.com/198.18.88.80$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
-	grep -q '^address=/dlassets.xboxlive.cn/203.0.113.10$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	grep -q '^address=/assets1.xboxlive.cn/219.152.87.113$' "$tmp" || { DOMAINS=$old; REDIR_MAP=$old_map; rm -f "$tmp" "$map" "$dom"; return 1; }
+	render_dns '' 203.0.113.10 1 "$tmp" || { DOMAINS=$old; REDIR_MAP=$old_map; rm -f "$tmp" "$map" "$dom"; return 1; }
+	grep -q '^address=/dlassets.xboxlive.com/198.51.100.9$' "$tmp" || { DOMAINS=$old; REDIR_MAP=$old_map; rm -f "$tmp" "$map" "$dom"; return 1; }
+	grep -q '^address=/dlassets.xboxlive.cn/203.0.113.10$' "$tmp" || { DOMAINS=$old; REDIR_MAP=$old_map; rm -f "$tmp" "$map" "$dom"; return 1; }
 	if grep -q 'assets1.xboxlive.com' "$tmp" || grep -q '^srv-host=' "$tmp"; then
 		DOMAINS=$old
-		rm -f "$tmp"
+		REDIR_MAP=$old_map
+		rm -f "$tmp" "$map" "$dom"
 		echo "legacy redirect included primary com" >&2
 		return 1
 	fi
+	# IPv6 off must not suppress AAAA.
+	( setting_ipv6_mode() { printf 'off\n'; }
+	  REDIR_MAP=$map
+	  DOMAINS=$share/domains
+	  render_dns 219.152.87.113 '' 1 "$tmp.off"
+	  grep -q '^local=/' "$tmp.off" && exit 1
+	  grep -q '^address=/assets1.xboxlive.com/198.51.100.1$' "$tmp.off" || exit 1
+	) || { DOMAINS=$old; REDIR_MAP=$old_map; rm -f "$tmp" "$map" "$dom" "$tmp.off"; return 1; }
+	# Alias assignment and origin/HTTPS separation.
+	printf 'assets1.xboxlive.com\tprimary\tglobal\nxvcf1.xboxlive.cn\tprimary\talias\n' > "$dom"
+	( DOMAINS=$dom REDIR_MAP=$map2 REDIR_ORIGINS=$origins
+	  redirect_net_overlaps_lan() { return 1; }
+	  setting_redirect_net() { printf '198.51.100.0/24\n'; }
+	  resolve_origin() { printf '23.1.1.99\n'; }
+	  build_redirect_map 219.152.87.113 '' 1 || exit 1
+	  grep -q '^assets1.xboxlive.com[[:space:]]198.51.100.1[[:space:]]23.1.1.99$' "$map2" || exit 1
+	  grep -q '^xvcf1.xboxlive.cn[[:space:]]198.51.100.2[[:space:]]-$' "$map2" || exit 1
+	) || { DOMAINS=$old; REDIR_MAP=$old_map; REDIR_ORIGINS=$old_origins; rm -f "$tmp" "$map" "$dom"; return 1; }
 	DOMAINS=$old
-	rm -f "$tmp"
+	REDIR_MAP=$old_map
+	REDIR_ORIGINS=$old_origins
+	rm -f "$tmp" "$map" "$dom" "$map2" "$origins" "$tmp.off"
 	echo PASS redirect
 }
 
@@ -1885,6 +2417,39 @@ cmd_check() {
 	RESULTS=$t2
 	[ "$(compare_com)" = "1 0.900 0.900 0.900" ] || { rm -f "$t1" "$t2"; exit 1; }
 	rm -f "$t1" "$t2"
+	valid_redirect_net 198.51.100.0/24 || exit 1
+	valid_redirect_net 198.51.100.1/24 && exit 1
+	valid_redirect_net 0.0.0.0/24 && exit 1
+	usable_origin_ipv4 23.1.1.1 || exit 1
+	usable_origin_ipv4 198.18.88.80 && exit 1
+	usable_origin_ipv4 198.51.100.1 && exit 1
+	usable_origin_ipv4 192.168.1.1 && exit 1
+	t3=$(mktemp) || exit 1
+	printf 'assets1.xboxlive.com\t198.51.100.1\t23.1.1.1\nxvcf1.xboxlive.cn\t198.51.100.2\t-\n' > "$t3"
+	old_map=$REDIR_MAP
+	REDIR_MAP=$t3
+	nft_rules > /tmp/xboxaccel.nft.preview || { REDIR_MAP=$old_map; rm -f "$t3"; exit 1; }
+	grep -q 'set redirect_v4' /tmp/xboxaccel.nft.preview || { REDIR_MAP=$old_map; rm -f "$t3"; exit 1; }
+	grep -q 'map https4' /tmp/xboxaccel.nft.preview || { REDIR_MAP=$old_map; rm -f "$t3"; exit 1; }
+	grep -q 'tcp dport 443 dnat' /tmp/xboxaccel.nft.preview || { REDIR_MAP=$old_map; rm -f "$t3"; exit 1; }
+	REDIR_MAP=$old_map
+	rm -f "$t3" /tmp/xboxaccel.nft.preview
+	old_domains=$DOMAINS
+	DOMAINS="$share/domains"
+	t4=$(mktemp) || exit 1
+	i=1
+	while [ "$i" -le 10 ]; do
+		printf '23.1.1.%s\tL\tassets1.xboxlive.cn\tcn1\n' "$i" >> "$t4"
+		i=$((i + 1))
+	done
+	[ "$(nodes_validate "$t4" | awk 'END { print NR + 0 }')" = 10 ] || { DOMAINS=$old_domains; rm -f "$t4"; exit 1; }
+	printf '10.0.0.1\tbad\tassets1.xboxlive.cn\tcn1\n' >> "$t4"
+	nodes_validate "$t4" >/dev/null || { DOMAINS=$old_domains; rm -f "$t4"; exit 1; }
+	t5=$(mktemp) || { DOMAINS=$old_domains; rm -f "$t4"; exit 1; }
+	printf '23.1.1.1\tL\tassets1.xboxlive.cn\tcn1\n10.0.0.1\tbad\tassets1.xboxlive.cn\tcn1\n' > "$t5"
+	nodes_validate "$t5" >/dev/null && { DOMAINS=$old_domains; rm -f "$t4" "$t5"; exit 1; }
+	DOMAINS=$old_domains
+	rm -f "$t4" "$t5"
 	public_ipv4 203.0.113.10 || exit 1
 	public_ipv4 8.8.8.8 || exit 1
 	public_ipv4 100.128.0.1 || exit 1
@@ -1902,7 +2467,7 @@ cmd_check() {
 }
 
 usage() {
-	echo "usage: xboxaccel {apply|clear|repair|test [routine|thorough] [carrier] [cn|com]|test-bg sweep carrier [cn|com]|tick|use primary|legacy ip|probe ip [cn|com]|probe-bg ip [cn|com]|stop|preview [primary] [legacy]|check|log [n]|log clear|log conn [clear]}"
+	echo "usage: xboxaccel {apply|clear|repair|refresh|test [routine|thorough] [carrier] [cn|com]|test-bg sweep carrier [cn|com]|tick|use primary|legacy ip|probe ip [cn|com]|probe-bg ip [cn|com]|stop|preview [primary] [legacy]|nft-preview|nodes-update [url]|nodes-status|nodes-clear|check|log [n]|log clear|log conn [clear]}"
 	exit 1
 }
 
@@ -1966,7 +2531,12 @@ case "${1:-}" in
 		exit 0
 		;;
 	stop) cmd_stop ;;
+	refresh) cmd_refresh ;;
 	preview) cmd_preview "$2" "$3" ;;
+	nft-preview) cmd_nft_preview "$2" ;;
+	nodes-update) cmd_nodes_update "$2" ;;
+	nodes-status) cmd_nodes_status ;;
+	nodes-clear) cmd_nodes_clear ;;
 	check) cmd_check ;;
 	log) cmd_log "$2" "$3" ;;
 	*) usage ;;

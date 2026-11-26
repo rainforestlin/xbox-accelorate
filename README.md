@@ -16,7 +16,7 @@ opkg install /tmp/luci-app-xboxaccel_*_all.ipk
 
 这个 ipk 是 gzip 压缩的 tar 包，供使用 opkg 的 OpenWrt / iStoreOS 24.10 安装。依赖 `luci-base`、`curl`、`uhttpd`、`nftables` 和 `kmod-nft-nat`。
 
-1.1.0 及更早的包里没有 302 跳转，`assets1.xboxlive.com` 会被直接写成节点地址，节点返回 `Deny-Reason: hotload no host conf!!`。1.2.0 的源码加了跳转，但仓库此前没有生成 1.2.0 的 ipk；路由器上如果还是旧包，dnsmasq 里不会出现 `198.18.88.80`，也不会有 8079 监听。
+1.1.0 及更早的包里没有 302 跳转，`assets1.xboxlive.com` 会被直接写成节点地址，节点返回 `Deny-Reason: hotload no host conf!!`。1.2.0 的源码加了跳转，但仓库此前没有生成 1.2.0 的 ipk；路由器上如果还是旧包，dnsmasq 里不会出现跳转假地址，也不会有 8079 监听。
 
 自己打包时，在仓库根目录执行：
 
@@ -32,7 +32,7 @@ python tools/build_ipk.py
 - `RELEASE` 是打包修订：只改脚本/依赖/权限、不改代码行为时递增；`VERSION` 变化时重置为 `1`。
 - **普通提交不要求改版本。** 构建同一个版本可以反复覆盖产物；只有发布或重新打包时才改 `VERSION`/`RELEASE`。
 - 发布流程：改 `VERSION`/`RELEASE` → 提交 → 打 `v$(cat VERSION)` 标签 → `python tools/build_ipk.py`。
-- 当前版本：`1.3.0-1`。
+- 当前版本：`1.4.0-1`。
 
 `ipk/control` 里的 `Version` 只是给人看的基线；`tools/build_ipk.py` 会用 `VERSION`/`RELEASE` 覆盖它。`Makefile` 同样直接读取这两个文件。
 
@@ -43,11 +43,18 @@ python tools/build_ipk.py
 3. 把 Xbox 的 DNS 改成这台路由器的局域网地址，端口用默认的 53。
 4. 按下面两种模式之一启用节点。
 
-`assets1`、`assets2`、`d1`、`d2` 的 `.xboxlive.cn` 直接指向选中的 IPv4。`.xboxlive.com` 在「国际域名跳转到国内域名」打开时指向路由器自己，由路由器返回 HTTP 302：主下载名（`assets1`、`assets2`、`d1`、`d2`、`xvcf1`、`xvcf2`）跳到 `assets1.xboxlive.cn`，旧下载名（`dlassets`、`dlassets2`）跳到 `dlassets.xboxlive.cn`。国内节点只认这些 `.cn` 主机名，把 `.com` 直接解析成节点地址会返回 403 `hotload no host conf!!`。
+`assets1`、`assets2`、`d1`、`d2` 的 `.xboxlive.cn` 直接指向选中的 IPv4。`.xboxlive.com`、`xvcf*.xboxlive.cn` 和备用 CDN 名在「国际域名跳转到国内域名」打开时，各自分配一个来自「跳转地址段」的假 IPv4：nft 把这个假地址的 TCP 80 转到本机 `8079` 的 302，把 TCP 443 DNAT 回真实源站。主下载名跳到 `assets1.xboxlive.cn`，旧下载名跳到 `dlassets.xboxlive.cn`；HTTPS 不会被黑洞，也不需要安装证书。
 
-`xvcf1.xboxlive.cn`、`xvcf2.xboxlive.cn` 在公网 DNS 里没有记录，国内节点也没有这两个 vhost。它们和 `.com` 一样走 302 到 `assets1.xboxlive.cn`，不能再直接写成节点地址（直接写会得到 403 或 502）。
+`xvcf1.xboxlive.cn`、`xvcf2.xboxlive.cn` 在公网 DNS 里没有记录，国内节点也没有这两个 vhost。它们只做 HTTP 302 到 `assets1.xboxlive.cn`，没有 HTTPS 源站可回；直接写成节点地址会得到 403 或 502。
 
-备用 CDN 名 `5.xb.delivery.microsoft.com`、`assets1.xboxlive.com.edgesuite.net`、`cl-glcb907925.gcdn.co`、`fg.microsoft.map.fastly.net` 同样跳到 `assets1.xboxlive.cn`。`assets-srvs.xboxlive.com` 及其 SRV 目标改写成 `assets1.xboxlive.com:80`，避免主机中途改走海外 CDN。做法与 [XboxDownload](https://github.com/skydevil88/XboxDownload) 的 OpenWrt 说明一致，但不改管理页的 80 端口。
+备用 CDN 名 `5.xb.delivery.microsoft.com`、`assets1.xboxlive.com.edgesuite.net`、`cl-glcb907925.gcdn.co`、`fg.microsoft.map.fastly.net` 同样走 302 / HTTPS 回源。`assets-srvs.xboxlive.com` 及其 SRV 目标改写成 `assets1.xboxlive.com:80`，避免主机中途改走海外 CDN。做法与 [XboxDownload](https://github.com/skydevil88/XboxDownload) 的 OpenWrt 说明一致，但不改管理页的 80 端口。
+
+### HTTPS 回源
+
+- 每个需要 302 的 host 从 `redirect_net`（默认 `198.51.100.0/24`）取一个假 IPv4，DNS 返回这个假地址。
+- nft 只把假地址的 80 转到本机 302；443 通过 `https4` map DNAT 到该 host 的真实源站 IP，TLS SNI 仍是原 `.com` 主机名，不 MITM。
+- 源站 IP 由「源站解析 DNS」解析，缓存在 `/tmp/xboxaccel.origins`，默认 6 小时刷新；解析失败的 host 不写假地址，退回正常 DNS，HTTP 不会加速但 HTTPS 不会被黑洞。
+- 旧版本的单个 `198.18.88.80` 会在升级时清理；新地址段避开 Clash 常见 `198.18.0.0/16`，仍建议把 `redirect_net` 排除在代理 fake-IP/路由之外。
 
 ### 为什么 .com 不能直接指到节点
 
@@ -66,6 +73,22 @@ CDN 按 HTTP `Host` 选虚拟主机。国内节点只配置了 `.cn` 名字；`H
 路由器会按间隔测速，默认 30 分钟，可在页面上修改。当前节点连不上时，立刻换到最快的可用节点。当前节点仍然可用时，新节点至少快过 20% 才切换。没有可用节点时，撤掉对应线路的改写。
 
 主下载和旧下载各自选一个地址：主下载地址用于 `assets`、`d1`、`d2`、`xvcf`，旧下载地址只用于 `dlassets`。两条线路互不影响；旧下载地址不会改变主下载域名的解析。
+
+## 节点列表
+
+内置的 `nodes.tsv` 是基线。页面「节点列表」可以填在线 URL、备用 URL 和可选 SHA-256，点「在线更新」后从 HTTPS 拉取、校验格式/校验和，成功缓存到 `/tmp/xboxaccel.nodes.tsv` 并优先使用；断网、校验失败或文件损坏时回退旧缓存，再回退内置列表。
+
+```sh
+/usr/sbin/xboxaccel nodes-update [url]
+/usr/sbin/xboxaccel nodes-status
+/usr/sbin/xboxaccel nodes-clear
+```
+
+在线列表沿用 `ip<TAB>loc<TAB>host<TAB>group` 四列，`group` 只接受 `cn1`/`cn2`，host 必须在 `domains` 里。SHA-256 为空时只做 HTTPS 和格式校验；填了就必须匹配原始下载文件。
+
+## IPv6
+
+`ipv6_mode=block`（默认）会抑制被改写域名的 AAAA，避免主机绕过选点；`off` 不抑制 AAAA，兼容性更好，但 `.com`/`.cn` 可能直接走 IPv6 原解析，不经过本插件。当前没有 IPv6 节点选点。
 
 ## 测速
 
@@ -94,7 +117,7 @@ CDN 按 HTTP `Host` 选虚拟主机。国内节点只配置了 `.cn` 名字；`H
 
 内置列表是公开的 Xbox 国内 IPv4 节点。额外地址可以在「额外 IP」里添加。把列表中已有 IP 的「参与」关掉，即可让它不参加测速。
 
-选中的地址发生变化时会重启 dnsmasq，使新记录生效。重启期间解析会短暂停一下。跳转监听在本机 `8079` 端口；`198.18.88.80:80` 上没有单独的监听进程，是一条 nft 规则把该地址的 80 端口转到 8079，管理页仍用原来的 80 端口。检查时看 `nft list table inet xboxaccel`、`logread -e xboxaccel`，或直接 `curl -H 'Host: assets1.xboxlive.com' http://198.18.88.80/Z/routing/extraextralarge.txt` 是否返回 302。页面上的运行日志里，成功会写 `国际域名跳转已启动`；如果出现 `没有 nft`、`没有 uhttpd` 或 `跳转服务没有起来`，按提示补依赖或检查 8079 是否被占用。如果路由器上跑 Clash/OpenClash 一类 fake-IP 代理（常见 `198.18.0.0/16`），`198.18.88.80` 可能被代理接管，需要把该地址设为直连或换掉 fake-IP 段。保存后让 Xbox 重新连接无线，清掉已经缓存的地址。主机 DNS 只填这台路由器；这些名字不再返回 IPv6。
+选中的地址发生变化时会重启 dnsmasq，使新记录生效。重启期间解析会短暂停一下。跳转监听在本机 `8079` 端口；`nft list table inet xboxaccel` 里能看到 `redirect_v4` set 和 `https4` map：80 端口转到 8079，443 回源到真实地址，管理页仍用原来的 80 端口。检查时看 `nslookup assets1.xboxlive.com` 是否返回 `198.51.100.x`，再 `curl -sS -D - -o /dev/null http://assets1.xboxlive.com/Z/routing/extraextralarge.txt` 是否 302，`openssl s_client -connect assets1.xboxlive.com:443 -servername assets1.xboxlive.com` 是否 TLS 握手成功。页面运行日志成功会写 `国际域名跳转已启动`；如果出现 `没有 nft`、`没有 uhttpd`、`源站解析失败` 或 `跳转服务没有起来`，按提示检查。保存后让 Xbox 重新连接无线，清掉已经缓存的地址。主机 DNS 只填这台路由器。
 
 ### 连接日志
 
@@ -106,6 +129,23 @@ CDN 按 HTTP `Host` 选虚拟主机。国内节点只配置了 `.cn` 名字；`H
 ```
 
 只记录经过本插件 302 的请求（`.com`、`xvcf*.cn`、备用 CDN 名）。`.cn` 文件下载是主机直连节点，不经过路由器上的用户态服务，所以这里看不到每个文件连接；要记录所有 Xbox TCP 连接需要 nft/conntrack，量大且复杂，没有做。`.com` 测速的请求客户端是 `127.0.0.1`，可以用筛选过滤。
+
+## 发布校验
+
+`python tools/build_ipk.py` 会在产物目录生成 `SHA256SUMS`。发布时用离线 `usign` 私钥签这个清单：
+
+```sh
+sh tools/sign_release.sh dist /path/release.key /path/release.pub
+sh tools/verify_release.sh dist
+```
+
+opkg 本身不支持逐包强制签名，所以这里校验的是 ipk 的 SHA-256 和可选的 `SHA256SUMS.sig`；如果必须 APK 级包签名，需要另做 OpenWrt 25.12 APK 迁移。
+
+## 致谢
+
+- [Zachery-Liu/luci-app-xboxdownload-openwrt](https://github.com/Zachery-Liu/luci-app-xboxdownload-openwrt)：按设备/多线路组织、fake IP + 443 回源、在线节点导入、签名发布和测试实践给了很多参考。其代码为 AGPL-3.0，本项目只参考思路和公开域名信息，未复制其代码。
+- [skydevil88/XboxDownload](https://github.com/skydevil88/XboxDownload)：`.com -> .cn` 跳转思路、域名表、测速样本和 OpenWrt 说明的来源；感谢长期维护公开 IP/样本。
+- 两个项目的版权与许可归各自作者；本项目与它们没有隶属、赞助或认可关系。
 
 ## 许可
 

@@ -480,6 +480,8 @@ return view.extend({
 				summary += parsed.sweep === 'routine' ? ' · 快速' : ' · 完整';
 			if (parsed.sweep && parsed.probe_scheme === 'com')
 				summary += ' · .com 302';
+			if (!running && Number(parsed.origin_missing) > 0)
+				summary += ' · 源站缺失 ' + parsed.origin_missing;
 			if (!running && parsed.probe_scheme === 'com' && Number(parsed.com_n) > 0 && parsed.com_avg)
 				summary += ' · .com/.cn 平均 ' + Math.round(Number(parsed.com_avg) * 100) + '%' +
 					'（最差 ' + Math.round(Number(parsed.com_min) * 100) + '%）' +
@@ -495,7 +497,7 @@ return view.extend({
 			primaryReason.textContent = reasonText(parsed.primary_reason);
 			legacyReason.textContent = reasonText(parsed.legacy_reason);
 			modeValue.textContent = parsed.mode === 'dynamic' ? '动态' : '静态';
-			modeReason.textContent = domains.length + ' 个域名';
+			modeReason.textContent = domains.length + ' 个域名' + (parsed.redirect_net ? ' · ' + parsed.redirect_net : '');
 			if (quickButton)
 				quickButton.disabled = running || !!pendingIp;
 			if (fullButton)
@@ -636,9 +638,39 @@ return view.extend({
 		carrier.rmempty = false;
 
 		var pin = s.option(form.Flag, 'pin_global', _('国际域名跳转到国内域名'),
-			_('打开后，.xboxlive.com 以及国内节点没有配置的 xvcf1/2.xboxlive.cn 解析到本机并 302 到节点认的 .cn 主机名，文件仍从选中的国内节点下载。关掉后这些名字恢复原来的解析。国内节点只认 .cn 的主机名，把 .com 或 xvcf 的 .cn 直接指到节点会被拒绝。保存后让主机重新连接无线，清掉已经缓存的地址。'));
+			_('打开后，.xboxlive.com 以及国内节点没有配置的 xvcf1/2.xboxlive.cn 解析到本机：HTTP 302 到节点认的 .cn 主机名，HTTPS 回源到真实源站，不再黑洞。关掉后这些名字恢复原来的解析。保存后让主机重新连接无线，清掉已经缓存的地址。'));
 		pin.default = '1';
 		pin.rmempty = false;
+
+		var redirNet = s.option(form.Value, 'redirect_net', _('跳转地址段'),
+			_('每个 .com 主机从这个 /24 里取一个假 IPv4；nft 只拦 80 端口做 302，443 回源。默认 198.51.100.0/24，避开 Clash 常见 fake-IP 段。'));
+		redirNet.placeholder = '198.51.100.0/24';
+		redirNet.rmempty = false;
+		redirNet.validate = function(section_id, value) {
+			var m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.0\/24$/.exec(value || '');
+			if (!m)
+				return _('必须是 a.b.c.0/24 形式的 /24 网段');
+			if (Number(m[1]) < 1 || Number(m[1]) > 223)
+				return _('首段必须在 1–223 之间');
+			return true;
+		};
+
+		var originDns = s.option(form.Value, 'origin_dns', _('源站解析 DNS'),
+			_('解析 .com HTTPS 真实源站用的 DNS，空格分隔；留空时读系统 resolv.conf，再回退公共 DNS。'));
+		originDns.placeholder = '223.5.5.5 119.29.29.29';
+
+		var originTtl = s.option(form.Value, 'origin_ttl', _('源站缓存（秒）'),
+			_('源站解析结果保留时间，默认 21600 秒；到期由 refresh 任务更新。'));
+		originTtl.datatype = 'range(300,604800)';
+		originTtl.placeholder = '21600';
+		originTtl.rmempty = false;
+
+		var ipv6 = s.option(form.ListValue, 'ipv6_mode', _('IPv6'),
+			_('block 抑制被改写域名的 AAAA，避免绕过选点；off 允许 AAAA 走原解析，可能绕过加速但兼容性更好。'));
+		ipv6.value('block', _('block（推荐）'));
+		ipv6.value('off', _('off（兼容）'));
+		ipv6.default = 'block';
+		ipv6.rmempty = false;
 
 		var probe = s.option(form.Button, '_probe', _('快速测速'),
 			_('8 MB 样本，每条线路最多 10 个地址。定时巡检也用这个规模。'));
@@ -692,6 +724,34 @@ return view.extend({
 		var en = c.option(form.Flag, 'enabled', _('参与'));
 		en.default = '1';
 		en.editable = true;
+
+		var nodeSrc = m.section(form.NamedSection, 'main', 'settings', _('节点列表'),
+			_('内置 nodes.tsv 是基线；在线更新会从固定 HTTPS URL 拉取、校验格式和可选 SHA-256，成功后缓存到 /tmp 并优先使用。'));
+		nodeSrc.option(form.Value, 'nodes_url', _('在线列表 URL')).placeholder = 'https://…/nodes.tsv';
+		nodeSrc.option(form.Value, 'nodes_url_backup', _('备用 URL')).placeholder = 'https://…/nodes.tsv';
+		nodeSrc.option(form.Value, 'nodes_sha256', _('SHA-256（可选）'),
+			_('填了就必须匹配下载文件；留空只做 HTTPS 和格式校验。'));
+		var nodeUpdate = nodeSrc.option(form.Button, '_nodes_update', _('在线更新'));
+		nodeUpdate.inputstyle = 'apply';
+		nodeUpdate.inputtitle = _('在线更新');
+		nodeUpdate.onclick = function() {
+			return fs.exec('/usr/sbin/xboxaccel', ['nodes-update']).then(function(res) {
+				var output = (res.stdout || '') + (res.stderr || '');
+				ui.addNotification(null, E('p', {}, [output || _('节点列表已更新')]), res.code === 0 ? 'info' : undefined);
+			});
+		};
+		var nodeStatus = nodeSrc.option(form.DummyValue, '_nodes_status');
+		nodeStatus.render = function() {
+			var el = E('span', { 'class': 'xa-s' }, [_('读取中…')]);
+			fs.exec('/usr/sbin/xboxaccel', ['nodes-status']).then(function(res) {
+				var lines = String(res.stdout || '').split(/\n/).filter(Boolean).map(function(line) {
+					var p = line.split('\t');
+					return p[0] + ': ' + (p[1] || '');
+				});
+				el.textContent = lines.join(' · ');
+			}).catch(function() { el.textContent = ''; });
+			return el;
+		};
 
 		var live = m.section(form.NamedSection, 'main', 'settings', _('测速结果'));
 		var board = live.option(form.DummyValue, '_board');
@@ -829,6 +889,7 @@ return view.extend({
 				'服务': 'run',
 				'测速样本': 'nodes',
 				'额外地址': 'nodes',
+				'节点列表': 'nodes',
 				'测速结果': 'nodes',
 				'运行日志': 'log'
 			};

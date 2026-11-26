@@ -2,6 +2,7 @@
 """Build an OpenWrt/iStoreOS gzip-compressed tar ipk."""
 
 import gzip
+import hashlib
 import io
 import re
 import subprocess
@@ -168,6 +169,9 @@ def main() -> None:
     OUTDIR.mkdir(parents=True, exist_ok=True)
     out = OUTDIR / NAME
     out.write_bytes(gzip_bytes(payload.getvalue()))
+    digest = hashlib.sha256(out.read_bytes()).hexdigest()
+    with (OUTDIR / "SHA256SUMS").open("w", encoding="utf-8", newline="\n") as fh:
+        fh.write(f"{digest}  {out.name}\n")
     print(out)
 
 
