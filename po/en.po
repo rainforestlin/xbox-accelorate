@@ -1,0 +1,265 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-xboxaccel\n"
+"Language: en\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "启用节点"
+msgstr "Enable node"
+
+msgid "正在写入"
+msgstr "Writing"
+
+msgid "启用失败"
+msgstr "Enable failed"
+
+msgid "没能停止测速"
+msgstr "Failed to stop the speed test"
+
+msgid "当前没有正在进行的测速"
+msgstr "No speed test is currently running"
+
+msgid "测速未能启动"
+msgstr "Speed test failed to start"
+
+msgid "已有一轮测速在进行"
+msgstr "A speed test is already running"
+
+msgid "没有可显示的节点。换一个筛选，或先测速。"
+msgstr "No nodes to show. Change the filter or run a speed test first."
+
+msgid "没有符合筛选的记录。"
+msgstr "No records match the filter."
+
+msgid "还没有连接记录。"
+msgstr "No connection records yet."
+
+msgid "还没有运行记录。"
+msgstr "No run records yet."
+
+msgid "清空连接日志"
+msgstr "Clear connection log"
+
+msgid "清空日志"
+msgstr "Clear log"
+
+msgid "只清掉连接日志列表，已经生效的解析和运行日志不变。"
+msgstr "Only clears the connection log list; active DNS records and the run log are unchanged."
+
+msgid "只清掉这个列表。系统里的其他日志不动，已经生效的解析也不变。"
+msgstr "Only clears this list. Other system logs and active DNS records are unchanged."
+
+msgid "取消"
+msgstr "Cancel"
+
+msgid "清空"
+msgstr "Clear"
+
+msgid "Xbox 下载选点"
+msgstr "Xbox Download Node Selector"
+
+msgid "主下载和旧下载分开选地址。只有把 DNS 指到本机 53 端口的设备会命中。定时巡检只测短名单，不会把全部节点重新拉一遍。"
+msgstr "Primary and legacy downloads use separate addresses. Only devices using this router on port 53 are affected. Scheduled checks probe a shortlist, not every node."
+
+msgid "服务"
+msgstr "Service"
+
+msgid "启用"
+msgstr "Enable"
+
+msgid "模式"
+msgstr "Mode"
+
+msgid "静态"
+msgstr "Static"
+
+msgid "动态"
+msgstr "Dynamic"
+
+msgid "巡检间隔（分钟）"
+msgstr "Check interval (minutes)"
+
+msgid "切换阈值（%）"
+msgstr "Switch threshold (%)"
+
+msgid "新地址至少比当前地址快过这个百分比，动态模式才会更换。"
+msgstr "In dynamic mode, switch only when the new address is at least this much faster."
+
+msgid "运营商"
+msgstr "Carrier"
+
+msgid "定时巡检和页面上的测速都按这里过滤。未保存时，按钮会用下拉框里当前的值。"
+msgstr "Scheduled checks and page tests use this filter. Unsaved changes use the current dropdown value when starting a test."
+
+msgid "全部运营商"
+msgstr "All carriers"
+
+msgid "电信"
+msgstr "China Telecom"
+
+msgid "联通"
+msgstr "China Unicom"
+
+msgid "移动"
+msgstr "China Mobile"
+
+msgid "国际域名跳转到国内域名"
+msgstr "Redirect international domains to domestic names"
+
+msgid "打开后，.xboxlive.com 以及国内节点没有配置的 xvcf1/2.xboxlive.cn 解析到本机：HTTP 302 到节点认的 .cn 主机名，HTTPS 回源到真实源站，不再黑洞。关掉后这些名字恢复原来的解析。保存后让主机重新连接无线，清掉已经缓存的地址。"
+msgstr "When enabled, .xboxlive.com and xvcf1/2.xboxlive.cn (which domestic nodes do not serve) resolve to this router: HTTP is redirected with a 302 to the .cn host the node accepts, while HTTPS is passed through to the real origin instead of being blackholed. When disabled, these names use normal DNS. After saving, reconnect the console to Wi-Fi to clear cached addresses."
+
+msgid "跳转地址段"
+msgstr "Redirect address range"
+
+msgid "每个 .com 主机从这个 /24 里取一个假 IPv4；nft 只拦 80 端口做 302，443 回源。默认 198.51.100.0/24，避开 Clash 常见 fake-IP 段。"
+msgstr "Each .com host gets a fake IPv4 from this /24; nft redirects only port 80 to the local 302 listener and passes 443 to the origin. Default 198.51.100.0/24, outside the common Clash fake-IP range."
+
+msgid "必须是 a.b.c.0/24 形式的 /24 网段"
+msgstr "Must be a /24 network in a.b.c.0/24 form"
+
+msgid "首段必须在 1–223 之间"
+msgstr "The first octet must be between 1 and 223"
+
+msgid "源站解析 DNS"
+msgstr "Origin resolver DNS"
+
+msgid "解析 .com HTTPS 真实源站用的 DNS，空格分隔；留空时读系统 resolv.conf，再回退公共 DNS。"
+msgstr "DNS servers used to resolve the real .com HTTPS origins, space-separated. Leave empty to use the system resolv.conf, then public DNS."
+
+msgid "源站缓存（秒）"
+msgstr "Origin cache (seconds)"
+
+msgid "源站解析结果保留时间，默认 21600 秒；到期由 refresh 任务更新。"
+msgstr "How long resolved origins are cached; default 21600 seconds. The refresh job renews them."
+
+msgid "IPv6"
+msgstr "IPv6"
+
+msgid "block 抑制被改写域名的 AAAA，避免绕过选点；off 允许 AAAA 走原解析，可能绕过加速但兼容性更好。"
+msgstr "block suppresses AAAA for rewritten names to prevent bypassing the selector; off allows AAAA from normal DNS, which may bypass acceleration but improves compatibility."
+
+msgid "block（推荐）"
+msgstr "block (recommended)"
+
+msgid "off（兼容）"
+msgstr "off (compatible)"
+
+msgid "快速测速"
+msgstr "Quick test"
+
+msgid "8 MB 样本，每条线路最多 10 个地址。定时巡检也用这个规模。"
+msgstr "8 MB sample, up to 10 addresses per pool. Scheduled checks use the same size."
+
+msgid "完整测速"
+msgstr "Full test"
+
+msgid "使用下面的样本大小，每条线路最多 24 个地址，并按城市分散抽取。"
+msgstr "Use the sample size below, up to 24 addresses per pool, distributed across cities."
+
+msgid "停止测速"
+msgstr "Stop speed test"
+
+msgid "停下这一轮测速。已经生效的地址保持不变。"
+msgstr "Stop this speed test. Addresses already in effect stay unchanged."
+
+msgid "测速样本"
+msgstr "Test sample"
+
+msgid "测速域名"
+msgstr "Test domain"
+
+msgid ".cn 直连选点；.com 经本机 302 跳到同一个节点，用来对照 .com 路径的实际速度。"
+msgstr ".cn direct selection; .com goes through the local 302 to the same node to compare the real .com path."
+
+msgid ".cn 直连"
+msgstr ".cn direct"
+
+msgid ".com 经 302"
+msgstr ".com via 302"
+
+msgid "手动地址使用的域名"
+msgstr "Host used for manual addresses"
+
+msgid "手动地址测速时用的 Host；批量测速的域名由上面的“测速域名”决定。填 .com 也会自动换成节点认的 .cn。"
+msgstr "Host used when testing a manual address; batch tests use the domain selected above. A .com value is automatically changed to the node's .cn host."
+
+msgid "主下载路径"
+msgstr "Primary download path"
+
+msgid "旧下载路径"
+msgstr "Legacy download path"
+
+msgid "旧节点不提供 /Z/routing 样本，默认使用 XboxDownload 的 cn2 样本文件；留空时也用这个默认值。"
+msgstr "Legacy nodes do not serve /Z/routing samples; the XboxDownload cn2 sample is used by default. Leave empty to keep this default."
+
+msgid "完整测速样本（MB）"
+msgstr "Full test sample (MB)"
+
+msgid "额外地址"
+msgstr "Extra addresses"
+
+msgid "内置列表会自动参加。把同一个地址的「参与」关掉，即可从测速中排除。"
+msgstr "Built-in nodes join automatically. Turn off Participate for an address to exclude it from tests."
+
+msgid "备注"
+msgstr "Note"
+
+msgid "IP"
+msgstr "IP"
+
+msgid "线路"
+msgstr "Pool"
+
+msgid "主下载"
+msgstr "Primary"
+
+msgid "旧下载"
+msgstr "Legacy"
+
+msgid "参与"
+msgstr "Participate"
+
+msgid "节点列表"
+msgstr "Node list"
+
+msgid "内置 nodes.tsv 是基线；在线更新会从固定 HTTPS URL 拉取、校验格式和可选 SHA-256，成功后缓存到 /tmp 并优先使用。"
+msgstr "The built-in nodes.tsv is the baseline; online updates fetch a fixed HTTPS URL, validate the format and optional SHA-256, then cache the result in /tmp and prefer it."
+
+msgid "在线列表 URL"
+msgstr "Online list URL"
+
+msgid "备用 URL"
+msgstr "Backup URL"
+
+msgid "SHA-256（可选）"
+msgstr "SHA-256 (optional)"
+
+msgid "填了就必须匹配下载文件；留空只做 HTTPS 和格式校验。"
+msgstr "If set, it must match the downloaded file; leave empty for HTTPS and format validation only."
+
+msgid "在线更新"
+msgstr "Update online"
+
+msgid "节点列表已更新"
+msgstr "Node list updated"
+
+msgid "读取中…"
+msgstr "Loading…"
+
+msgid "测速结果"
+msgstr "Speed test results"
+
+msgid "运行日志"
+msgstr "Run log"
+
+msgid "运行日志记录选点、测速和解析；连接日志记录每次 .com/xvcf 302 请求的客户端、Host、路径和目标。只保留最近记录。"
+msgstr "The run log records selection, tests and DNS; the connection log records each .com/xvcf 302 request's client, Host, path and target. Only recent records are kept."
+
+msgid "刷新"
+msgstr "Refresh"
+
+msgid "连接日志"
+msgstr "Connection log"

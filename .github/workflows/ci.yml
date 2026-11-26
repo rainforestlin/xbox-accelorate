@@ -14,35 +14,17 @@ jobs:
         with:
           node-version: '20'
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Install test tools
         run: |
           sudo apt-get update
           sudo apt-get install -y nftables
 
-      - name: Shell syntax
-        run: |
-          for f in \
-            src/usr/sbin/xboxaccel \
-            src/usr/share/xboxaccel/policy \
-            src/usr/share/xboxaccel/roster \
-            src/usr/share/xboxaccel/redir-run \
-            src/usr/share/xboxaccel/www/cgi-bin/redirect \
-            src/etc/init.d/xboxaccel \
-            src/etc/hotplug.d/iface/99-xboxaccel; do
-            sh -n "$f"
-          done
-
-      - name: Self tests
-        run: sh src/usr/sbin/xboxaccel check
-
-      - name: JavaScript syntax
-        run: node --check src/www/luci-static/resources/view/xboxaccel.js
-
-      - name: Python syntax
-        run: python -m py_compile tools/build_ipk.py
-
-      - name: Build package
-        run: python tools/build_ipk.py
+      - name: Test suite
+        run: sh tests/run.sh
 
       - name: Validate package
         run: |

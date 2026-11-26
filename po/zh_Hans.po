@@ -1,0 +1,265 @@
+msgid ""
+msgstr ""
+"Project-Id-Version: luci-app-xboxaccel\n"
+"Language: zh_Hans\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "启用节点"
+msgstr "启用节点"
+
+msgid "正在写入"
+msgstr "正在写入"
+
+msgid "启用失败"
+msgstr "启用失败"
+
+msgid "没能停止测速"
+msgstr "没能停止测速"
+
+msgid "当前没有正在进行的测速"
+msgstr "当前没有正在进行的测速"
+
+msgid "测速未能启动"
+msgstr "测速未能启动"
+
+msgid "已有一轮测速在进行"
+msgstr "已有一轮测速在进行"
+
+msgid "没有可显示的节点。换一个筛选，或先测速。"
+msgstr "没有可显示的节点。换一个筛选，或先测速。"
+
+msgid "没有符合筛选的记录。"
+msgstr "没有符合筛选的记录。"
+
+msgid "还没有连接记录。"
+msgstr "还没有连接记录。"
+
+msgid "还没有运行记录。"
+msgstr "还没有运行记录。"
+
+msgid "清空连接日志"
+msgstr "清空连接日志"
+
+msgid "清空日志"
+msgstr "清空日志"
+
+msgid "只清掉连接日志列表，已经生效的解析和运行日志不变。"
+msgstr "只清掉连接日志列表，已经生效的解析和运行日志不变。"
+
+msgid "只清掉这个列表。系统里的其他日志不动，已经生效的解析也不变。"
+msgstr "只清掉这个列表。系统里的其他日志不动，已经生效的解析也不变。"
+
+msgid "取消"
+msgstr "取消"
+
+msgid "清空"
+msgstr "清空"
+
+msgid "Xbox 下载选点"
+msgstr "Xbox 下载选点"
+
+msgid "主下载和旧下载分开选地址。只有把 DNS 指到本机 53 端口的设备会命中。定时巡检只测短名单，不会把全部节点重新拉一遍。"
+msgstr "主下载和旧下载分开选地址。只有把 DNS 指到本机 53 端口的设备会命中。定时巡检只测短名单，不会把全部节点重新拉一遍。"
+
+msgid "服务"
+msgstr "服务"
+
+msgid "启用"
+msgstr "启用"
+
+msgid "模式"
+msgstr "模式"
+
+msgid "静态"
+msgstr "静态"
+
+msgid "动态"
+msgstr "动态"
+
+msgid "巡检间隔（分钟）"
+msgstr "巡检间隔（分钟）"
+
+msgid "切换阈值（%）"
+msgstr "切换阈值（%）"
+
+msgid "新地址至少比当前地址快过这个百分比，动态模式才会更换。"
+msgstr "新地址至少比当前地址快过这个百分比，动态模式才会更换。"
+
+msgid "运营商"
+msgstr "运营商"
+
+msgid "定时巡检和页面上的测速都按这里过滤。未保存时，按钮会用下拉框里当前的值。"
+msgstr "定时巡检和页面上的测速都按这里过滤。未保存时，按钮会用下拉框里当前的值。"
+
+msgid "全部运营商"
+msgstr "全部运营商"
+
+msgid "电信"
+msgstr "电信"
+
+msgid "联通"
+msgstr "联通"
+
+msgid "移动"
+msgstr "移动"
+
+msgid "国际域名跳转到国内域名"
+msgstr "国际域名跳转到国内域名"
+
+msgid "打开后，.xboxlive.com 以及国内节点没有配置的 xvcf1/2.xboxlive.cn 解析到本机：HTTP 302 到节点认的 .cn 主机名，HTTPS 回源到真实源站，不再黑洞。关掉后这些名字恢复原来的解析。保存后让主机重新连接无线，清掉已经缓存的地址。"
+msgstr "打开后，.xboxlive.com 以及国内节点没有配置的 xvcf1/2.xboxlive.cn 解析到本机：HTTP 302 到节点认的 .cn 主机名，HTTPS 回源到真实源站，不再黑洞。关掉后这些名字恢复原来的解析。保存后让主机重新连接无线，清掉已经缓存的地址。"
+
+msgid "跳转地址段"
+msgstr "跳转地址段"
+
+msgid "每个 .com 主机从这个 /24 里取一个假 IPv4；nft 只拦 80 端口做 302，443 回源。默认 198.51.100.0/24，避开 Clash 常见 fake-IP 段。"
+msgstr "每个 .com 主机从这个 /24 里取一个假 IPv4；nft 只拦 80 端口做 302，443 回源。默认 198.51.100.0/24，避开 Clash 常见 fake-IP 段。"
+
+msgid "必须是 a.b.c.0/24 形式的 /24 网段"
+msgstr "必须是 a.b.c.0/24 形式的 /24 网段"
+
+msgid "首段必须在 1–223 之间"
+msgstr "首段必须在 1–223 之间"
+
+msgid "源站解析 DNS"
+msgstr "源站解析 DNS"
+
+msgid "解析 .com HTTPS 真实源站用的 DNS，空格分隔；留空时读系统 resolv.conf，再回退公共 DNS。"
+msgstr "解析 .com HTTPS 真实源站用的 DNS，空格分隔；留空时读系统 resolv.conf，再回退公共 DNS。"
+
+msgid "源站缓存（秒）"
+msgstr "源站缓存（秒）"
+
+msgid "源站解析结果保留时间，默认 21600 秒；到期由 refresh 任务更新。"
+msgstr "源站解析结果保留时间，默认 21600 秒；到期由 refresh 任务更新。"
+
+msgid "IPv6"
+msgstr "IPv6"
+
+msgid "block 抑制被改写域名的 AAAA，避免绕过选点；off 允许 AAAA 走原解析，可能绕过加速但兼容性更好。"
+msgstr "block 抑制被改写域名的 AAAA，避免绕过选点；off 允许 AAAA 走原解析，可能绕过加速但兼容性更好。"
+
+msgid "block（推荐）"
+msgstr "block（推荐）"
+
+msgid "off（兼容）"
+msgstr "off（兼容）"
+
+msgid "快速测速"
+msgstr "快速测速"
+
+msgid "8 MB 样本，每条线路最多 10 个地址。定时巡检也用这个规模。"
+msgstr "8 MB 样本，每条线路最多 10 个地址。定时巡检也用这个规模。"
+
+msgid "完整测速"
+msgstr "完整测速"
+
+msgid "使用下面的样本大小，每条线路最多 24 个地址，并按城市分散抽取。"
+msgstr "使用下面的样本大小，每条线路最多 24 个地址，并按城市分散抽取。"
+
+msgid "停止测速"
+msgstr "停止测速"
+
+msgid "停下这一轮测速。已经生效的地址保持不变。"
+msgstr "停下这一轮测速。已经生效的地址保持不变。"
+
+msgid "测速样本"
+msgstr "测速样本"
+
+msgid "测速域名"
+msgstr "测速域名"
+
+msgid ".cn 直连选点；.com 经本机 302 跳到同一个节点，用来对照 .com 路径的实际速度。"
+msgstr ".cn 直连选点；.com 经本机 302 跳到同一个节点，用来对照 .com 路径的实际速度。"
+
+msgid ".cn 直连"
+msgstr ".cn 直连"
+
+msgid ".com 经 302"
+msgstr ".com 经 302"
+
+msgid "手动地址使用的域名"
+msgstr "手动地址使用的域名"
+
+msgid "手动地址测速时用的 Host；批量测速的域名由上面的“测速域名”决定。填 .com 也会自动换成节点认的 .cn。"
+msgstr "手动地址测速时用的 Host；批量测速的域名由上面的“测速域名”决定。填 .com 也会自动换成节点认的 .cn。"
+
+msgid "主下载路径"
+msgstr "主下载路径"
+
+msgid "旧下载路径"
+msgstr "旧下载路径"
+
+msgid "旧节点不提供 /Z/routing 样本，默认使用 XboxDownload 的 cn2 样本文件；留空时也用这个默认值。"
+msgstr "旧节点不提供 /Z/routing 样本，默认使用 XboxDownload 的 cn2 样本文件；留空时也用这个默认值。"
+
+msgid "完整测速样本（MB）"
+msgstr "完整测速样本（MB）"
+
+msgid "额外地址"
+msgstr "额外地址"
+
+msgid "内置列表会自动参加。把同一个地址的「参与」关掉，即可从测速中排除。"
+msgstr "内置列表会自动参加。把同一个地址的「参与」关掉，即可从测速中排除。"
+
+msgid "备注"
+msgstr "备注"
+
+msgid "IP"
+msgstr "IP"
+
+msgid "线路"
+msgstr "线路"
+
+msgid "主下载"
+msgstr "主下载"
+
+msgid "旧下载"
+msgstr "旧下载"
+
+msgid "参与"
+msgstr "参与"
+
+msgid "节点列表"
+msgstr "节点列表"
+
+msgid "内置 nodes.tsv 是基线；在线更新会从固定 HTTPS URL 拉取、校验格式和可选 SHA-256，成功后缓存到 /tmp 并优先使用。"
+msgstr "内置 nodes.tsv 是基线；在线更新会从固定 HTTPS URL 拉取、校验格式和可选 SHA-256，成功后缓存到 /tmp 并优先使用。"
+
+msgid "在线列表 URL"
+msgstr "在线列表 URL"
+
+msgid "备用 URL"
+msgstr "备用 URL"
+
+msgid "SHA-256（可选）"
+msgstr "SHA-256（可选）"
+
+msgid "填了就必须匹配下载文件；留空只做 HTTPS 和格式校验。"
+msgstr "填了就必须匹配下载文件；留空只做 HTTPS 和格式校验。"
+
+msgid "在线更新"
+msgstr "在线更新"
+
+msgid "节点列表已更新"
+msgstr "节点列表已更新"
+
+msgid "读取中…"
+msgstr "读取中…"
+
+msgid "测速结果"
+msgstr "测速结果"
+
+msgid "运行日志"
+msgstr "运行日志"
+
+msgid "运行日志记录选点、测速和解析；连接日志记录每次 .com/xvcf 302 请求的客户端、Host、路径和目标。只保留最近记录。"
+msgstr "运行日志记录选点、测速和解析；连接日志记录每次 .com/xvcf 302 请求的客户端、Host、路径和目标。只保留最近记录。"
+
+msgid "刷新"
+msgstr "刷新"
+
+msgid "连接日志"
+msgstr "连接日志"

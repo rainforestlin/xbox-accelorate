@@ -130,6 +130,24 @@ CDN 按 HTTP `Host` 选虚拟主机。国内节点只配置了 `.cn` 名字；`H
 
 只记录经过本插件 302 的请求（`.com`、`xvcf*.cn`、备用 CDN 名）。`.cn` 文件下载是主机直连节点，不经过路由器上的用户态服务，所以这里看不到每个文件连接；要记录所有 Xbox TCP 连接需要 nft/conntrack，量大且复杂，没有做。`.com` 测速的请求客户端是 `127.0.0.1`，可以用筛选过滤。
 
+## 语言
+
+中文是源语言，英文目录在 [po/en.po](po/en.po)，中文对照在 [po/zh_Hans.po](po/zh_Hans.po)。LuCI 读取编译后的 `.lmo`：
+
+```sh
+python tools/build_i18n.py --out-dir src/usr/lib/lua/luci/i18n
+```
+
+生成 `xboxaccel.en.lmo`，安装到 `/usr/lib/lua/luci/i18n/`；在 LuCI 里切换语言后，`_()` 文案会使用对应目录，找不到时回退中文。修改页面文案后要同时更新 `.po` 并重新生成 `.lmo`，`tests/run.sh` 会检查两者是否一致。
+
+## 测试
+
+```sh
+sh tests/run.sh
+```
+
+包含：shell 语法、现有 `xboxaccel check` 自测、Python 单元测试（i18n 哈希/目录/翻译覆盖、打包器）、JS 语法、i18n 重新编译一致性、ipk 构建和包内容检查；root + 有 `nft` 时还会跑 `nft -c`。
+
 ## 发布校验
 
 `python tools/build_ipk.py` 会在产物目录生成 `SHA256SUMS`。发布时用离线 `usign` 私钥签这个清单：

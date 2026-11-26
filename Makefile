@@ -51,6 +51,8 @@ define Package/luci-app-xboxaccel/install
 	$(INSTALL_DATA) ./src/usr/share/luci/menu.d/luci-app-xboxaccel.json $(1)/usr/share/luci/menu.d/luci-app-xboxaccel.json
 	$(INSTALL_DIR) $(1)/usr/share/rpcd/acl.d
 	$(INSTALL_DATA) ./src/usr/share/rpcd/acl.d/luci-app-xboxaccel.json $(1)/usr/share/rpcd/acl.d/luci-app-xboxaccel.json
+	$(INSTALL_DIR) $(1)/usr/lib/lua/luci/i18n
+	$(INSTALL_DATA) ./src/usr/lib/lua/luci/i18n/xboxaccel.en.lmo $(1)/usr/lib/lua/luci/i18n/xboxaccel.en.lmo
 	$(INSTALL_DIR) $(1)/www/luci-static/resources/view
 	$(INSTALL_DATA) ./src/www/luci-static/resources/view/xboxaccel.js $(1)/www/luci-static/resources/view/xboxaccel.js
 	$(INSTALL_DATA) ./src/www/luci-static/resources/view/xboxaccel.css $(1)/www/luci-static/resources/view/xboxaccel.css
