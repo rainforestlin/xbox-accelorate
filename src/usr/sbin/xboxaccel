@@ -17,11 +17,13 @@ PARTS=/tmp/xboxaccel.parts
 LAST=/tmp/xboxaccel.last
 GEN=/tmp/xboxaccel.gen
 STOP=/tmp/xboxaccel.stop
+SCHEME_FILE=/tmp/xboxaccel.scheme
 LOCK=/var/run/xboxaccel.lock
 CRON_FILE=/etc/crontabs/root
 CRON_LINE='*/5 * * * * /usr/sbin/xboxaccel tick # xboxaccel'
 CONF_NAME=xboxaccel.conf
 LOG=/tmp/xboxaccel.log
+CONN_LOG=/tmp/xboxaccel.redirect.log
 # .com names land here and answer HTTP 302. .cn names keep the selected CDN address.
 # 198.18.88.80/32 is added to the LAN bridge; nft sends only that address's port 80 to REDIR_PORT.
 REDIR_IP=198.18.88.80
@@ -31,6 +33,9 @@ REDIR_PID=/var/run/xboxaccel.redir.pid
 REDIR_HTTP_PID=/var/run/xboxaccel.uhttpd.pid
 REDIR_DEVS=/tmp/xboxaccel.redir.devs
 REDIR_LOG=/tmp/xboxaccel.redir.log
+# The legacy CDN (XboxOne-era cn2 nodes) does not carry /Z/routing/extraextralarge.txt.
+# This is one of the public cn2 sample files used by XboxDownload's speed test.
+LEGACY_SAMPLE=/public/content/0044aef3-bd7e-4478-8782-6191546dcd9a/f6585e19-765c-49c3-ba77-326c3766e05a/1.0.4.0.60281fce-b9c0-49f6-a2b6-027abad22637/ACBF_1.0.4.0_x64__b6krnev7r9sf8
 
 log() {
 	local lines
@@ -185,6 +190,13 @@ setting_pin() {
 	fi
 }
 
+setting_scheme() {
+	case "$(uci_get probe_scheme)" in
+		com) printf 'com\n' ;;
+		*) printf 'cn\n' ;;
+	esac
+}
+
 setting_primary() {
 	local value
 	if has_opt primary_ip; then
@@ -237,6 +249,61 @@ sample_path() {
 	else
 		printf '%s\n' /Z/routing/extraextralarge.txt
 	fi
+}
+
+sample_path_legacy() {
+	local path
+	path=$(uci_get sample_path_legacy)
+	[ -n "$path" ] || path=$LEGACY_SAMPLE
+	if valid_path "$path"; then
+		printf '%s\n' "$path"
+	else
+		printf '%s\n' "$LEGACY_SAMPLE"
+	fi
+}
+
+# The selected address is shared by both pools, but the Host header is not:
+# a domestic node rejects *.xboxlive.com and xvcf*.xboxlive.cn. Probes must
+# always use a name the node actually serves, even when sample_host is a .com.
+probe_host() {
+	local pool="$1" host
+	if [ "$pool" = legacy ]; then
+		printf '%s\n' dlassets.xboxlive.cn
+		return 0
+	fi
+	host=$(sample_host)
+	case "$host" in
+		dlassets.xboxlive.com|dlassets2.xboxlive.com) host=dlassets.xboxlive.cn ;;
+		xvcf1.xboxlive.cn|xvcf2.xboxlive.cn) host=assets1.xboxlive.cn ;;
+		*.xboxlive.com) host=assets1.xboxlive.cn ;;
+		5.xb.delivery.microsoft.com|assets1.xboxlive.com.edgesuite.net|cl-glcb907925.gcdn.co|fg.microsoft.map.fastly.net) host=assets1.xboxlive.cn ;;
+	esac
+	printf '%s\n' "$host"
+}
+
+# The .com speed check goes through the local 302 listener. The redirect
+# target is forced to the candidate address, so the comparison uses the same
+# node as the direct .cn probe.
+probe_com_host() {
+	case "$1" in
+		dlassets.xboxlive.cn|dlassets2.xboxlive.cn|dlassets.xboxlive.com|dlassets2.xboxlive.com)
+			printf '%s\n' dlassets.xboxlive.com
+			;;
+		*)
+			printf '%s\n' assets1.xboxlive.com
+			;;
+	esac
+}
+
+probe_cn_host() {
+	case "$1" in
+		dlassets.xboxlive.cn|dlassets2.xboxlive.cn|dlassets.xboxlive.com|dlassets2.xboxlive.com)
+			printf '%s\n' dlassets.xboxlive.cn
+			;;
+		*)
+			printf '%s\n' assets1.xboxlive.cn
+			;;
+	esac
 }
 
 enabled() {
@@ -615,8 +682,9 @@ render_dns() {
 				public_ipv4 "$ip" || continue
 				;;
 			global|hop)
-				# Domestic nodes reject Host: *.xboxlive.com. Send those names to the
-				# local redirector, which answers 302 to the matching .cn name.
+				# Domestic nodes reject Host: *.xboxlive.com and have no vhost for
+				# xvcf*.xboxlive.cn. Send both to the local redirector, which answers
+				# 302 to a .cn name the node accepts.
 				[ "$pin" = 1 ] || continue
 				case "$pool" in
 					primary) [ "$have_primary" = 1 ] || continue ;;
@@ -771,7 +839,7 @@ build_catalog() {
 			legacy) group=manual-legacy ;;
 			*) group=manual-primary ;;
 		esac
-		printf '%s\t%s\t%s\t%s\t1\n' "$ip" "${name:-手动}" "$(sample_host)" "$group" >> "$CATALOG"
+		printf '%s\t%s\t%s\t%s\t1\n' "$ip" "${name:-手动}" "$(probe_host "$pool")" "$group" >> "$CATALOG"
 	done
 	rm -f "$skip"
 }
@@ -787,14 +855,23 @@ collect_parts() {
 }
 
 probe_one() {
-	local ip="$1" host="$2" path="$3" loc="$4" group="$5" limit="$6" maxtime="$7"
-	local line rc http bps conn bytes bps_i ms ok
+	local ip="$1" host="$2" path="$3" loc="$4" group="$5" limit="$6" maxtime="$7" scheme="${8:-cn}"
+	local line rc http bps conn bytes bps_i ms ok scheme_host target_host redir total
 	mkdir -p "$PARTS"
-	curl -4 -sS -o /dev/null --http1.1 --noproxy '*' --max-filesize "$limit" \
+	set -- -4 -sS -o /dev/null --http1.1 --noproxy '*' --max-filesize "$limit" \
 		--range "0-$((limit - 1))" --connect-timeout 3 --max-time "$maxtime" \
-		--resolve "${host}:80:${ip}" \
-		-w '%{http_code} %{speed_download} %{time_connect} %{size_download}' \
-		"http://${host}${path}" > "$PARTS/$ip.curlout" 2>/dev/null &
+		-w '%{http_code} %{speed_download} %{time_connect} %{size_download} %{time_redirect} %{time_total}'
+	if [ "$scheme" = com ]; then
+		scheme_host=$(probe_com_host "$host")
+		target_host=$(probe_cn_host "$host")
+		set -- "$@" -L --max-redirs 3 \
+			--resolve "${scheme_host}:${REDIR_PORT}:127.0.0.1" \
+			--resolve "${target_host}:80:${ip}" \
+			"http://${scheme_host}:${REDIR_PORT}${path}"
+	else
+		set -- "$@" --resolve "${host}:80:${ip}" "http://${host}${path}"
+	fi
+	curl "$@" > "$PARTS/$ip.curlout" 2>/dev/null &
 	echo $! > "$PARTS/$ip.curl"
 	wait $!
 	rc=$?
@@ -805,13 +882,21 @@ probe_one() {
 	bps=${2:-0}
 	conn=${3:-0}
 	bytes=${4:-0}
+	redir=${5:-0}
+	total=${6:-0}
+	case "$redir" in ''|*[!0-9.]*) redir=0 ;; esac
+	case "$total" in ''|*[!0-9.]*) total=0 ;; esac
 	if [ "$rc" -ne 0 ] && [ "$rc" -ne 28 ]; then
 		http=000
 		bps=0
 		bytes=0
 	fi
 	http=$(awk -v s="$http" 'BEGIN { printf "%d", s + 0 }')
-	bps_i=$(awk -v s="$bps" 'BEGIN { printf "%d", s + 0 }')
+	if [ "$scheme" = com ] && awk -v r="$redir" -v t="$total" 'BEGIN { exit !(r > 0 && t > r) }'; then
+		bps_i=$(awk -v b="$bytes" -v t="$total" -v r="$redir" 'BEGIN { printf "%d", b / (t - r) }')
+	else
+		bps_i=$(awk -v s="$bps" 'BEGIN { printf "%d", s + 0 }')
+	fi
 	ms=$(awk -v s="$conn" 'BEGIN { printf "%d", (s + 0) * 1000 }')
 	bytes=$(awk -v s="$bytes" 'BEGIN { printf "%d", s + 0 }')
 	ok=0
@@ -864,8 +949,17 @@ wait_batch() {
 }
 
 run_probes() {
-	local ip loc host group en n=0 limit maxtime path
+	local ip loc host group en n=0 limit maxtime path path_legacy probe_path scheme
+	scheme=${SCHEME:-cn}
 	path=$(sample_path)
+	path_legacy=$(sample_path_legacy)
+	if [ "$scheme" = com ]; then
+		if ! ensure_http; then
+			log "跳转服务没有起来，.com 测速无法开始"
+			SCHEME_FAILED=1
+			return 1
+		fi
+	fi
 	if [ "$SWEEP" = routine ]; then
 		limit=$((8 * 1048576))
 		maxtime=12
@@ -878,6 +972,11 @@ run_probes() {
 		maxtime=18
 		CAP=24
 	fi
+	if [ "$scheme" = com ] && [ "$limit" -lt 16777216 ]; then
+		limit=$((16 * 1048576))
+		SAMPLE_MIB=16
+		maxtime=18
+	fi
 	rm -rf "$PARTS"
 	mkdir -p "$PARTS"
 	: > "$RESULTS"
@@ -888,7 +987,11 @@ run_probes() {
 		[ "$en" = "1" ] || continue
 		public_ipv4 "$ip" || continue
 		valid_host "$host" || continue
-		probe_one "$ip" "$host" "$path" "$loc" "$group" "$limit" "$maxtime" &
+		case "$group" in
+			cn2|manual-legacy) probe_path=$path_legacy ;;
+			*) probe_path=$path ;;
+		esac
+		probe_one "$ip" "$host" "$probe_path" "$loc" "$group" "$limit" "$maxtime" "$scheme" &
 		BATCH="$BATCH $!"
 		n=$((n + 1))
 		if [ "$n" -ge 6 ]; then
@@ -961,6 +1064,7 @@ write_status() {
 	json_add_int margin "$(setting_margin)"
 	json_add_string carrier "${CARRIER:-$(setting_carrier)}"
 	json_add_string sweep "${SWEEP:-}"
+	json_add_string probe_scheme "${SCHEME:-$(setting_scheme)}"
 	json_add_string probe_ip "${PROBE_IP:-}"
 	json_add_int probe_bytes "${PROBE_BYTES:-0}"
 	json_add_int probe_bps "${PROBE_BPS:-0}"
@@ -975,6 +1079,11 @@ write_status() {
 	json_add_int finished "$finished"
 	json_add_int sample_mib "${SAMPLE_MIB:-$(setting_mib)}"
 	json_add_int cap "${CAP:-0}"
+	json_add_int com_n "${COM_N:-0}"
+	json_add_string com_avg "${COM_AVG:-}"
+	json_add_string com_min "${COM_MIN:-}"
+	json_add_string com_max "${COM_MAX:-}"
+	json_add_int com_warn "${COM_WARN:-0}"
 	json_add_array results
 	if [ -f "$RESULTS" ]; then
 		while IFS="$(printf '\t')" read -r ip http bps ms ok bytes group host loc; do
@@ -1052,8 +1161,31 @@ take_decision() {
 	printf '%s\t%s\n' "$ip" "$reason"
 }
 
+compare_com() {
+	[ "$SCHEME" = com ] || return 0
+	[ "$PREV_SCHEME" = cn ] || return 0
+	[ -s "$HISTORY" ] || return 0
+	[ -s "$RESULTS" ] || return 0
+	awk -F '\t' '
+		NR == FNR {
+			if ($5 == 1 && ($3 + 0) > 0) cn[$1] = $3 + 0
+			next
+		}
+		$5 == 1 && ($1 in cn) && cn[$1] > 0 {
+			n++
+			r = ($3 + 0) / cn[$1]
+			sum += r
+			if (min == 0 || r < min) min = r
+			if (max == 0 || r > max) max = r
+		}
+		END {
+			if (n) printf "%d %.3f %.3f %.3f\n", n, sum / n, min, max
+		}
+	' "$HISTORY" "$RESULTS"
+}
+
 finish_test() {
-	local mode margin cur_p cur_l picked reason_p reason_l new_p new_l
+	local mode margin cur_p cur_l picked reason_p reason_l new_p new_l com
 	mode=$(setting_mode)
 	margin=$(setting_margin)
 	if [ "$mode" = static ]; then
@@ -1116,13 +1248,35 @@ finish_test() {
 	PRIMARY_REASON=$reason_p
 	LEGACY_REASON=$reason_l
 	OVERALL=$(summary_reason "$reason_p" "$reason_l")
+	COM_N=0
+	COM_AVG=
+	COM_MIN=
+	COM_MAX=
+	COM_WARN=0
+	if [ "$SCHEME" = com ]; then
+		com=$(compare_com)
+		if [ -n "$com" ]; then
+			set -- $com
+			COM_N=$1
+			COM_AVG=$2
+			COM_MIN=$3
+			COM_MAX=$4
+			if awk -v m="$COM_AVG" 'BEGIN { exit !(m > 0 && m < 0.8) }'; then
+				COM_WARN=1
+			fi
+			log ".com/.cn 对照：${COM_N} 个节点，平均 $(awk -v x="$COM_AVG" 'BEGIN { printf "%.0f%%", x * 100 }')，最差 $(awk -v x="$COM_MIN" 'BEGIN { printf "%.0f%%", x * 100 }')"
+			if [ "$COM_WARN" = 1 ]; then
+				log ".com 测速平均比 .cn 慢超过 20%（平均 $(awk -v x="$COM_AVG" 'BEGIN { printf "%.0f%%", x * 100 }')）"
+			fi
+		fi
+	fi
 	write_status 0
 	date +%s > "$LAST"
 	log "测速结束 $OVERALL 主=${new_p:-无}($reason_p) 旧=${new_l:-无}($reason_l)"
 }
 
 cmd_test() {
-	local sweep="$1" carrier="$2"
+	local sweep="$1" carrier="$2" scheme="$3"
 	case "$sweep" in
 		routine|thorough) ;;
 		*) sweep=thorough ;;
@@ -1131,12 +1285,20 @@ cmd_test() {
 		any|telecom|unicom|mobile) ;;
 		*) carrier=$(setting_carrier) ;;
 	esac
+	case "$scheme" in
+		com|cn) ;;
+		*) scheme=$(setting_scheme) ;;
+	esac
+	SCHEME=$scheme
+	SCHEME_FAILED=0
 	exec 9>"$LOCK"
 	flock -n 9 || {
 		echo busy
 		log "已有一轮测速在进行"
 		exit 0
 	}
+	PREV_SCHEME=$(cat "$SCHEME_FILE" 2>/dev/null || true)
+	echo "$SCHEME" > "$SCHEME_FILE"
 	rm -f "$STOP"
 	gen0=$(cat "$GEN" 2>/dev/null || echo 0)
 	PROBE_IP=
@@ -1160,11 +1322,29 @@ cmd_test() {
 	fi
 	write_running
 	if [ "$SWEEP" = routine ]; then
-		log "开始快速测速，计划 ${PLANNED} 个地址"
+		if [ "$SCHEME" = com ]; then
+			log "开始快速测速，计划 ${PLANNED} 个地址（.com 302）"
+		else
+			log "开始快速测速，计划 ${PLANNED} 个地址（.cn 直连）"
+		fi
 	else
-		log "开始完整测速，计划 ${PLANNED} 个地址"
+		if [ "$SCHEME" = com ]; then
+			log "开始完整测速，计划 ${PLANNED} 个地址（.com 302）"
+		else
+			log "开始完整测速，计划 ${PLANNED} 个地址（.cn 直连）"
+		fi
 	fi
 	if ! run_probes || stale; then
+		if [ "$SCHEME_FAILED" = 1 ]; then
+			PRIMARY=$(setting_active_primary)
+			LEGACY=$(setting_active_legacy)
+			PRIMARY_REASON=redirect-failed
+			LEGACY_REASON=redirect-failed
+			OVERALL=redirect-failed
+			write_status 0
+			log ".com 测速失败：本机 302 跳转服务没有起来"
+			return 0
+		fi
 		note_stopped
 		return 0
 	fi
@@ -1321,16 +1501,25 @@ publish_probe() {
 }
 
 probe_watch() {
-	local ip="$1" host="$2" path="$3" loc="$4" group="$5" limit="$6" maxtime="$7"
-	local cpid rc line http bps conn bytes bps_i ms ok cur start_cs now_cs elapsed
+	local ip="$1" host="$2" path="$3" loc="$4" group="$5" limit="$6" maxtime="$7" scheme="${8:-cn}"
+	local cpid rc line http bps conn bytes bps_i ms ok cur start_cs now_cs elapsed scheme_host target_host redir total
 	mkdir -p "$PARTS"
 	rm -f "$PARTS/$ip.body" "$PARTS/$ip.curl" "$PARTS/$ip.curlout"
 	: > "$PARTS/$ip.body"
-	curl -4 -sS -o "$PARTS/$ip.body" --http1.1 --noproxy '*' --max-filesize "$limit" \
+	set -- -4 -sS -o "$PARTS/$ip.body" --http1.1 --noproxy '*' --max-filesize "$limit" \
 		--range "0-$((limit - 1))" --connect-timeout 3 --max-time "$maxtime" \
-		--resolve "${host}:80:${ip}" \
-		-w '%{http_code} %{speed_download} %{time_connect} %{size_download}' \
-		"http://${host}${path}" > "$PARTS/$ip.curlout" 2>/dev/null &
+		-w '%{http_code} %{speed_download} %{time_connect} %{size_download} %{time_redirect} %{time_total}'
+	if [ "$scheme" = com ]; then
+		scheme_host=$(probe_com_host "$host")
+		target_host=$(probe_cn_host "$host")
+		set -- "$@" -L --max-redirs 3 \
+			--resolve "${scheme_host}:${REDIR_PORT}:127.0.0.1" \
+			--resolve "${target_host}:80:${ip}" \
+			"http://${scheme_host}:${REDIR_PORT}${path}"
+	else
+		set -- "$@" --resolve "${host}:80:${ip}" "http://${host}${path}"
+	fi
+	curl "$@" > "$PARTS/$ip.curlout" 2>/dev/null &
 	cpid=$!
 	echo "$cpid" > "$PARTS/$ip.curl"
 	start_cs=$(awk '{ printf "%d", $1 * 100 }' /proc/uptime)
@@ -1362,13 +1551,21 @@ probe_watch() {
 	bps=${2:-0}
 	conn=${3:-0}
 	bytes=${4:-0}
+	redir=${5:-0}
+	total=${6:-0}
+	case "$redir" in ''|*[!0-9.]*) redir=0 ;; esac
+	case "$total" in ''|*[!0-9.]*) total=0 ;; esac
 	if [ "$rc" -ne 0 ] && [ "$rc" -ne 28 ]; then
 		http=000
 		bps=0
 		bytes=0
 	fi
 	http=$(awk -v s="$http" 'BEGIN { printf "%d", s + 0 }')
-	bps_i=$(awk -v s="$bps" 'BEGIN { printf "%d", s + 0 }')
+	if [ "$scheme" = com ] && awk -v r="$redir" -v t="$total" 'BEGIN { exit !(r > 0 && t > r) }'; then
+		bps_i=$(awk -v b="$bytes" -v t="$total" -v r="$redir" 'BEGIN { printf "%d", b / (t - r) }')
+	else
+		bps_i=$(awk -v s="$bps" 'BEGIN { printf "%d", s + 0 }')
+	fi
 	ms=$(awk -v s="$conn" 'BEGIN { printf "%d", (s + 0) * 1000 }')
 	bytes=$(awk -v s="$bytes" 'BEGIN { printf "%d", s + 0 }')
 	ok=0
@@ -1406,11 +1603,16 @@ restore_view() {
 }
 
 cmd_probe() {
-	local ip="$1" loc host group limit
+	local ip="$1" scheme="$2" loc host group limit pool path maxtime
 	public_ipv4 "$ip" || {
 		echo "这个地址不是公网 IPv4" >&2
 		exit 1
 	}
+	case "$scheme" in
+		com|cn) ;;
+		*) scheme=$(setting_scheme) ;;
+	esac
+	SCHEME=$scheme
 	exec 9>"$LOCK"
 	flock -n 9 || {
 		echo busy
@@ -1418,6 +1620,16 @@ cmd_probe() {
 	}
 	rm -f "$STOP"
 	gen0=$(cat "$GEN" 2>/dev/null || echo 0)
+	if [ "$SCHEME" = com ] && ! ensure_http; then
+		PRIMARY=$(setting_active_primary)
+		LEGACY=$(setting_active_legacy)
+		PRIMARY_REASON=redirect-failed
+		LEGACY_REASON=redirect-failed
+		OVERALL=redirect-failed
+		write_status 0
+		log "单点 .com 测速失败：本机 302 跳转服务没有起来"
+		return 0
+	fi
 	restore_view
 	SWEEP=once
 	PROBE_IP=$ip
@@ -1425,31 +1637,48 @@ cmd_probe() {
 	PROBE_BPS=0
 	PLANNED=0
 	CAP=1
-	SAMPLE_MIB=8
-	CARRIER=$(setting_carrier)
 	limit=$((8 * 1048576))
+	maxtime=12
+	if [ "$SCHEME" = com ]; then
+		limit=$((16 * 1048576))
+		maxtime=18
+	fi
+	SAMPLE_MIB=$((limit / 1048576))
+	CARRIER=$(setting_carrier)
 	PROBE_LIMIT=$limit
 	OVERALL=running
 	write_status 1
-	log "开始单点测速 $ip"
+	if [ "$SCHEME" = com ]; then
+		log "开始单点测速 $ip（.com 302）"
+	else
+		log "开始单点测速 $ip（.cn 直连）"
+	fi
 	loc=$(awk -F '\t' -v ip="$ip" '$1 == ip { print $2; exit }' "$NODES")
 	host=$(awk -F '\t' -v ip="$ip" '$1 == ip { print $3; exit }' "$NODES")
 	group=$(awk -F '\t' -v ip="$ip" '$1 == ip { print $4; exit }' "$NODES")
+	pool=primary
+	case "$group" in
+		cn2|manual-legacy) pool=legacy ;;
+	esac
 	if [ -z "$host" ]; then
 		set -- $(list_candidates | awk -F '\t' -v ip="$ip" '$1 == ip && $2 != "0" { print $4, $3; exit }')
 		case "$1" in
-			legacy) group=manual-legacy ;;
-			*) group=manual-primary ;;
+			legacy) group=manual-legacy; pool=legacy ;;
+			*) group=manual-primary; pool=primary ;;
 		esac
 		loc=${2:-手动}
-		host=$(sample_host)
+		host=$(probe_host "$pool")
 	fi
-	[ -n "$host" ] || host=$(sample_host)
+	[ -n "$host" ] || host=$(probe_host "$pool")
 	[ -n "$loc" ] || loc=手动
 	[ -n "$group" ] || group=manual-primary
-	valid_host "$host" || host=$(sample_host)
+	valid_host "$host" || host=$(probe_host "$pool")
+	case "$group" in
+		cn2|manual-legacy) path=$(sample_path_legacy) ;;
+		*) path=$(sample_path) ;;
+	esac
 	mkdir -p "$PARTS"
-	probe_watch "$ip" "$host" "$(sample_path)" "$loc" "$group" "$limit" 12
+	probe_watch "$ip" "$host" "$path" "$loc" "$group" "$limit" "$maxtime" "$SCHEME"
 	if stale; then
 		restore_view
 		SWEEP=once
@@ -1520,8 +1749,17 @@ cmd_clear() {
 }
 
 cmd_log() {
-	local n="${1:-200}"
+	local n="${1:-200}" action="$2"
 	case "$n" in
+		conn)
+			if [ "$action" = clear ]; then
+				: > "$CONN_LOG"
+				return 0
+			fi
+			[ -s "$CONN_LOG" ] || return 0
+			tail -n 200 "$CONN_LOG"
+			return 0
+			;;
 		clear)
 			: > "$LOG.seed"
 			: > "$LOG"
@@ -1561,6 +1799,10 @@ redirect_selftest() {
 	}
 	expect_redirect 'xvcf1.xboxlive.com' '/Z/routing/extraextralarge.txt' \
 		'http://assets1.xboxlive.cn/Z/routing/extraextralarge.txt' || return 1
+	expect_redirect 'xvcf1.xboxlive.cn' '/Z/routing/extraextralarge.txt' \
+		'http://assets1.xboxlive.cn/Z/routing/extraextralarge.txt' || return 1
+	expect_redirect 'XVCF2.Xboxlive.Cn:80' '/a?x=1' \
+		'http://assets1.xboxlive.cn/a?x=1' || return 1
 	expect_redirect 'Assets2.Xboxlive.Com:80' '/a?x=1' \
 		'http://assets1.xboxlive.cn/a?x=1' || return 1
 	expect_redirect 'dlassets2.xboxlive.com' '/old' \
@@ -1584,19 +1826,22 @@ redirect_selftest() {
 	grep -q '^address=/assets1.xboxlive.cn/219.152.87.113$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
 	grep -q '^address=/assets1.xboxlive.com/198.18.88.80$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
 	grep -q '^address=/xvcf2.xboxlive.com/198.18.88.80$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
+	grep -q '^address=/xvcf2.xboxlive.cn/198.18.88.80$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
 	grep -q '^address=/5.xb.delivery.microsoft.com/198.18.88.80$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
 	grep -q '^srv-host=assets-srvs-net.trafficmanager.net,assets1.xboxlive.com,80,0,0$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
-	if grep -q '^address=/assets1.xboxlive.com/219.152.87.113$' "$tmp" || grep -q 'dlassets.xboxlive.com' "$tmp"; then
+	if grep -q '^address=/assets1.xboxlive.com/219.152.87.113$' "$tmp" ||
+		grep -q '^address=/xvcf[12]\.xboxlive\.cn/219.152.87.113$' "$tmp" ||
+		grep -q 'dlassets.xboxlive.com' "$tmp"; then
 		DOMAINS=$old
 		rm -f "$tmp"
-		echo "com must not share the cdn address" >&2
+		echo "com and xvcf.cn must not share the cdn address" >&2
 		return 1
 	fi
 	render_dns 219.152.87.113 '' 0 "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
-	if grep -q 'xboxlive.com/' "$tmp" || grep -q '^srv-host=' "$tmp"; then
+	if grep -q 'xboxlive.com/' "$tmp" || grep -q 'xvcf[12]\.xboxlive\.cn' "$tmp" || grep -q '^srv-host=' "$tmp"; then
 		DOMAINS=$old
 		rm -f "$tmp"
-		echo "pin off still rewrote com" >&2
+		echo "pin off still rewrote redirected names" >&2
 		return 1
 	fi
 	grep -q '^address=/assets1.xboxlive.cn/219.152.87.113$' "$tmp" || { DOMAINS=$old; rm -f "$tmp"; return 1; }
@@ -1624,6 +1869,22 @@ cmd_check() {
 	/bin/sh "$policy" selftest || exit 1
 	/bin/sh "$roster" selftest || exit 1
 	redirect_selftest || exit 1
+	valid_path "$LEGACY_SAMPLE" || exit 1
+	[ "$(probe_host legacy)" = "dlassets.xboxlive.cn" ] || exit 1
+	[ "$(probe_com_host assets1.xboxlive.cn)" = "assets1.xboxlive.com" ] || exit 1
+	[ "$(probe_com_host dlassets.xboxlive.cn)" = "dlassets.xboxlive.com" ] || exit 1
+	[ "$(probe_cn_host assets1.xboxlive.com)" = "assets1.xboxlive.cn" ] || exit 1
+	[ "$(probe_cn_host dlassets2.xboxlive.com)" = "dlassets.xboxlive.cn" ] || exit 1
+	t1=$(mktemp) || exit 1
+	t2=$(mktemp) || exit 1
+	printf '198.51.100.1\t206\t1000\t1\t1\t100\tcn1\th\tL\n' > "$t1"
+	printf '198.51.100.1\t206\t900\t1\t1\t100\tcn1\th\tL\n' > "$t2"
+	SCHEME=com
+	PREV_SCHEME=cn
+	HISTORY=$t1
+	RESULTS=$t2
+	[ "$(compare_com)" = "1 0.900 0.900 0.900" ] || { rm -f "$t1" "$t2"; exit 1; }
+	rm -f "$t1" "$t2"
 	public_ipv4 203.0.113.10 || exit 1
 	public_ipv4 8.8.8.8 || exit 1
 	public_ipv4 100.128.0.1 || exit 1
@@ -1641,7 +1902,7 @@ cmd_check() {
 }
 
 usage() {
-	echo "usage: xboxaccel {apply|clear|repair|test [routine|thorough] [carrier]|test-bg sweep carrier|tick|use primary|legacy ip|probe ip|probe-bg ip|stop|preview [primary] [legacy]|check|log [n]|log clear}"
+	echo "usage: xboxaccel {apply|clear|repair|test [routine|thorough] [carrier] [cn|com]|test-bg sweep carrier [cn|com]|tick|use primary|legacy ip|probe ip [cn|com]|probe-bg ip [cn|com]|stop|preview [primary] [legacy]|check|log [n]|log clear|log conn [clear]}"
 	exit 1
 }
 
@@ -1649,10 +1910,11 @@ case "${1:-}" in
 	apply) cmd_apply ;;
 	clear) cmd_clear ;;
 	repair) cmd_repair ;;
-	test) cmd_test "$2" "$3" ;;
+	test) cmd_test "$2" "$3" "$4" ;;
 	test-bg)
 		sweep=$2
 		carrier=$3
+		scheme=$4
 		case "$sweep" in
 			routine|thorough) ;;
 			*) sweep=thorough ;;
@@ -1661,42 +1923,51 @@ case "${1:-}" in
 			any|telecom|unicom|mobile) ;;
 			*) carrier=$(setting_carrier) ;;
 		esac
+		case "$scheme" in
+			cn|com) ;;
+			*) scheme=$(setting_scheme) ;;
+		esac
 		exec 8>"$LOCK"
 		if ! flock -n 8; then
 			echo busy
 			exit 0
 		fi
 		flock -u 8
-		if start-stop-daemon -S -b -x /usr/sbin/xboxaccel -- test "$sweep" "$carrier"; then
+		if start-stop-daemon -S -b -x /usr/sbin/xboxaccel -- test "$sweep" "$carrier" "$scheme"; then
 			exit 0
 		fi
-		/usr/sbin/xboxaccel test "$sweep" "$carrier" >/tmp/xboxaccel.test.log 2>&1 </dev/null &
+		/usr/sbin/xboxaccel test "$sweep" "$carrier" "$scheme" >/tmp/xboxaccel.test.log 2>&1 </dev/null &
 		exit 0
 		;;
 	tick) cmd_tick ;;
 	use) cmd_use "$2" "$3" ;;
-	probe) cmd_probe "$2" ;;
+	probe) cmd_probe "$2" "$3" ;;
 	probe-bg)
 		ip=$2
+		scheme=$3
 		public_ipv4 "$ip" || {
 			echo "这个地址不是公网 IPv4" >&2
 			exit 1
 		}
+		case "$scheme" in
+			cn|com) ;;
+			*) scheme=$(setting_scheme) ;;
+		esac
 		exec 8>"$LOCK"
 		if ! flock -n 8; then
 			echo busy
 			exit 0
 		fi
 		flock -u 8
-		if start-stop-daemon -S -b -x /usr/sbin/xboxaccel -- probe "$ip"; then
+		if start-stop-daemon -S -b -x /usr/sbin/xboxaccel -- probe "$ip" "$scheme"; then
 			exit 0
 		fi
-		/usr/sbin/xboxaccel probe "$ip" >/tmp/xboxaccel.test.log 2>&1 </dev/null &
+		/usr/sbin/xboxaccel probe "$ip" "$scheme" >/tmp/xboxaccel.test.log 2>&1 </dev/null &
 		exit 0
 		;;
 	stop) cmd_stop ;;
 	preview) cmd_preview "$2" "$3" ;;
 	check) cmd_check ;;
-	log) cmd_log "$2" ;;
+	log) cmd_log "$2" "$3" ;;
 	*) usage ;;
 esac

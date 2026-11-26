@@ -1,11 +1,13 @@
 Package: luci-app-xboxaccel
-Version: 1.2.0-1
-Depends: libc, luci-base, curl
+Version: 1.3.0-1
+Depends: libc, luci-base, curl, uhttpd, nftables, kmod-nft-nat
 Architecture: all
-Installed-Size: 16
+Installed-Size: 160
 Section: luci
 License: Apache-2.0
 Maintainer: xboxaccel
 Description: Xbox download CDN selector for OpenWrt.
  Keeps separate primary and legacy addresses, suppresses AAAA for those names, and checks dnsmasq before leaving a new record in place.
- International download names are answered with an HTTP redirect to the .cn host instead of being pinned to the CDN address.
+ International names and xvcf*.xboxlive.cn are answered with an HTTP redirect to a .cn host the node serves instead of being pinned to the CDN address.
+ The speed test can measure the real .com 302 path and compare it with .cn without counting the redirect time.
+ Connection requests handled by the local 302 are kept in a separate small log.

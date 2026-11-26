@@ -9,8 +9,10 @@ assets1.xboxlive.cn	primary	cn
 assets2.xboxlive.cn	primary	cn
 d1.xboxlive.cn	primary	cn
 d2.xboxlive.cn	primary	cn
-xvcf1.xboxlive.cn	primary	cn
-xvcf2.xboxlive.cn	primary	cn
+# xvcf*.xboxlive.cn has no DNS record and no vhost on the domestic nodes.
+# Pinning it to a node returns 403/502, so send it through the 302 as well.
+xvcf1.xboxlive.cn	primary	global
+xvcf2.xboxlive.cn	primary	global
 dlassets.xboxlive.com	legacy	global
 dlassets2.xboxlive.com	legacy	global
 dlassets.xboxlive.cn	legacy	cn

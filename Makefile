@@ -1,8 +1,8 @@
 include $(TOPDIR)/rules.mk
 
 PKG_NAME:=luci-app-xboxaccel
-PKG_VERSION:=1.2.0
-PKG_RELEASE:=1
+PKG_VERSION:=$(shell cat $(CURDIR)/VERSION)
+PKG_RELEASE:=$(shell cat $(CURDIR)/RELEASE)
 PKG_LICENSE:=Apache-2.0
 PKG_MAINTAINER:=xboxaccel
 
@@ -13,7 +13,7 @@ define Package/luci-app-xboxaccel
   CATEGORY:=LuCI
   SUBMENU:=3. Applications
   TITLE:=Xbox download CDN selector
-  DEPENDS:=+curl +luci-base
+  DEPENDS:=+curl +luci-base +uhttpd +nftables +kmod-nft-nat
   PKGARCH:=all
 endef
 

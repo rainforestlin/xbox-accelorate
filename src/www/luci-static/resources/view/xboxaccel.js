@@ -20,6 +20,7 @@ var REASONS = {
 	stopped: '测速已停止',
 	probed: '单点测速完成',
 	'dns-failed': '记录没有生效，已退回上一份',
+	'redirect-failed': '跳转服务不可用，.com 测速未开始',
 	idle: '还没有测速'
 };
 
@@ -240,7 +241,7 @@ return view.extend({
 			E('option', { 'value': 'legacy' }, ['只看旧下载'])
 		]);
 		var scroll = E('div', { 'class': 'xa-scroll' });
-		var logScroll = E('div', { 'class': 'xa-scroll xa-log-scroll', 'tabindex': '0', 'aria-label': '运行日志' });
+		var logScroll = E('div', { 'class': 'xa-scroll xa-log-scroll', 'tabindex': '0', 'aria-label': '日志' });
 		var logQuery = E('input', {
 			'type': 'search',
 			'class': 'cbi-input-text',
@@ -248,6 +249,7 @@ return view.extend({
 			'placeholder': '筛选日志'
 		});
 		var logRaw = '';
+		var logView = 'run';
 		var logPinned = true;
 		var lastSignature = '';
 		var quickButton;
@@ -276,7 +278,8 @@ return view.extend({
 
 		function startSweep(sweep) {
 			var carrier = fieldValue('carrier') || 'any';
-			return fs.exec('/usr/sbin/xboxaccel', ['test-bg', sweep, carrier]).then(function(res) {
+			var scheme = fieldValue('probe_scheme') || 'cn';
+			return fs.exec('/usr/sbin/xboxaccel', ['test-bg', sweep, carrier, scheme]).then(function(res) {
 				var output = (res.stdout || '') + (res.stderr || '');
 				if (res.code !== 0) {
 					ui.addNotification(null, E('p', {}, [output || _('测速未能启动')]));
@@ -353,9 +356,10 @@ return view.extend({
 				return E('p', { 'class': 'xa-empty' }, [_('没有可显示的节点。换一个筛选，或先测速。')]);
 			}
 
+			var speedTitle = parsed.probe_scheme === 'com' ? '.com 速度' : '.cn 速度';
 			var table = E('table', { 'class': 'xa-table' }, [
 				E('thead', {}, [
-					E('tr', {}, ['线路', '位置', 'IP', '速度', '实收', '延迟', '结果', '操作'].map(function(title) {
+					E('tr', {}, ['线路', '位置', 'IP', speedTitle, '实收', '延迟', '结果', '操作'].map(function(title) {
 						return E('th', { 'scope': 'col' }, [title]);
 					}))
 				])
@@ -404,7 +408,8 @@ return view.extend({
 					pendingIp = item.node.ip;
 					pendingSnap = statusText;
 					paint(statusText);
-					return fs.exec('/usr/sbin/xboxaccel', ['probe-bg', item.node.ip]).then(function(res) {
+					var scheme = fieldValue('probe_scheme') || 'cn';
+					return fs.exec('/usr/sbin/xboxaccel', ['probe-bg', item.node.ip, scheme]).then(function(res) {
 						var output = (res.stdout || '') + (res.stderr || '');
 						if (res.code !== 0 || output.indexOf('busy') !== -1) {
 							if (pendingIp === item.node.ip)
@@ -473,6 +478,12 @@ return view.extend({
 				summary += ' · ' + (parsed.probe_ip || '单点');
 			else if (parsed.sweep)
 				summary += parsed.sweep === 'routine' ? ' · 快速' : ' · 完整';
+			if (parsed.sweep && parsed.probe_scheme === 'com')
+				summary += ' · .com 302';
+			if (!running && parsed.probe_scheme === 'com' && Number(parsed.com_n) > 0 && parsed.com_avg)
+				summary += ' · .com/.cn 平均 ' + Math.round(Number(parsed.com_avg) * 100) + '%' +
+					'（最差 ' + Math.round(Number(parsed.com_min) * 100) + '%）' +
+					(Number(parsed.com_warn) === 1 ? ' · 差距大' : '');
 			if (!pendingIp && !liveOnce && parsed.sample_mib)
 				summary += ' · 样本 ' + parsed.sample_mib + ' MB';
 			if (when && !pendingIp && !liveOnce)
@@ -515,7 +526,7 @@ return view.extend({
 				logScroll.removeChild(logScroll.firstChild);
 			if (!rows.length) {
 				logScroll.appendChild(E('p', { 'class': 'xa-empty' }, [
-					query ? _('没有符合筛选的记录。') : _('还没有运行记录。')
+					query ? _('没有符合筛选的记录。') : (logView === 'conn' ? _('还没有连接记录。') : _('还没有运行记录。'))
 				]));
 				return;
 			}
@@ -540,8 +551,9 @@ return view.extend({
 				logScroll.scrollTop = logScroll.scrollHeight;
 		}
 
-		function pullLog() {
-			return fs.exec('/usr/sbin/xboxaccel', ['log']).then(function(res) {
+		function fetchLog(kind) {
+			var cmd = kind === 'conn' ? ['log', 'conn'] : ['log'];
+			return fs.exec('/usr/sbin/xboxaccel', cmd).then(function(res) {
 				if (res.code !== 0)
 					return;
 				logRaw = res.stdout || '';
@@ -549,9 +561,24 @@ return view.extend({
 			}).catch(function() {});
 		}
 
+		function pullLog() {
+			logView = 'run';
+			return fetchLog('run');
+		}
+
+		function pullConnLog() {
+			logView = 'conn';
+			return fetchLog('conn');
+		}
+
+		function refreshLog() {
+			return fetchLog(logView);
+		}
+
 		function clearLog() {
-			ui.showModal(_('清空日志'), [
-				E('p', {}, [_('只清掉这个列表。系统里的其他日志不动，已经生效的解析也不变。')]),
+			var conn = logView === 'conn';
+			ui.showModal(conn ? _('清空连接日志') : _('清空日志'), [
+				E('p', {}, [conn ? _('只清掉连接日志列表，已经生效的解析和运行日志不变。') : _('只清掉这个列表。系统里的其他日志不动，已经生效的解析也不变。')]),
 				E('div', { 'class': 'right' }, [
 					E('button', { 'class': 'btn', 'type': 'button', 'click': ui.hideModal }, [_('取消')]),
 					E('button', {
@@ -561,9 +588,9 @@ return view.extend({
 							if (ev && ev.preventDefault)
 								ev.preventDefault();
 							ui.hideModal();
-							fs.exec('/usr/sbin/xboxaccel', ['log', 'clear']).then(function() {
+							fs.exec('/usr/sbin/xboxaccel', conn ? ['log', 'conn', 'clear'] : ['log', 'clear']).then(function() {
 								logPinned = true;
-								return pullLog();
+								return refreshLog();
 							});
 						}
 					}, [_('清空')])
@@ -609,7 +636,7 @@ return view.extend({
 		carrier.rmempty = false;
 
 		var pin = s.option(form.Flag, 'pin_global', _('国际域名跳转到国内域名'),
-			_('打开后，.xboxlive.com 解析到本机并 302 到对应的 .xboxlive.cn，文件仍从选中的国内节点下载。关掉后 .com 恢复原来的解析。国内节点只认 .cn 的主机名，把两个名字指到同一个地址会被拒绝。保存后让主机重新连接无线，清掉已经缓存的地址。'));
+			_('打开后，.xboxlive.com 以及国内节点没有配置的 xvcf1/2.xboxlive.cn 解析到本机并 302 到节点认的 .cn 主机名，文件仍从选中的国内节点下载。关掉后这些名字恢复原来的解析。国内节点只认 .cn 的主机名，把 .com 或 xvcf 的 .cn 直接指到节点会被拒绝。保存后让主机重新连接无线，清掉已经缓存的地址。'));
 		pin.default = '1';
 		pin.rmempty = false;
 
@@ -632,8 +659,18 @@ return view.extend({
 		halt.onclick = function() { return stopSweep(); };
 
 		var sample = m.section(form.NamedSection, 'main', 'settings', _('测速样本'));
-		sample.option(form.Value, 'sample_host', _('手动地址使用的域名')).placeholder = 'assets1.xboxlive.cn';
-		sample.option(form.Value, 'sample_path', _('路径')).placeholder = '/Z/routing/extraextralarge.txt';
+		var scheme = sample.option(form.ListValue, 'probe_scheme', _('测速域名'),
+			_('.cn 直连选点；.com 经本机 302 跳到同一个节点，用来对照 .com 路径的实际速度。'));
+		scheme.value('cn', _('.cn 直连'));
+		scheme.value('com', _('.com 经 302'));
+		scheme.default = 'cn';
+		scheme.rmempty = false;
+		sample.option(form.Value, 'sample_host', _('手动地址使用的域名'),
+			_('手动地址测速时用的 Host；批量测速的域名由上面的“测速域名”决定。填 .com 也会自动换成节点认的 .cn。'));
+		sample.option(form.Value, 'sample_path', _('主下载路径')).placeholder = '/Z/routing/extraextralarge.txt';
+		var legacyPath = sample.option(form.Value, 'sample_path_legacy', _('旧下载路径'),
+			_('旧节点不提供 /Z/routing 样本，默认使用 XboxDownload 的 cn2 样本文件；留空时也用这个默认值。'));
+		legacyPath.placeholder = '/public/content/...';
 		var mib = sample.option(form.Value, 'sample_mib', _('完整测速样本（MB）'));
 		mib.datatype = 'range(8,100)';
 		mib.placeholder = '50';
@@ -666,7 +703,7 @@ return view.extend({
 		};
 
 		var journal = m.section(form.NamedSection, 'main', 'settings', _('运行日志'),
-			_('只记录选点、测速和解析是否生效。第一次打开会把系统日志里本插件的旧记录收进来。'));
+			_('运行日志记录选点、测速和解析；连接日志记录每次 .com/xvcf 302 请求的客户端、Host、路径和目标。只保留最近记录。'));
 		var journalBoard = journal.option(form.DummyValue, '_journal');
 		journalBoard.render = function() {
 			return E('div', {}, [
@@ -679,9 +716,29 @@ return view.extend({
 							if (ev && ev.preventDefault)
 								ev.preventDefault();
 							logPinned = true;
-							return pullLog();
+							return refreshLog();
 						}
 					}, [_('刷新')]),
+					E('button', {
+						'type': 'button',
+						'class': 'cbi-button',
+						'click': function(ev) {
+							if (ev && ev.preventDefault)
+								ev.preventDefault();
+							logPinned = true;
+							return pullLog();
+						}
+					}, [_('运行日志')]),
+					E('button', {
+						'type': 'button',
+						'class': 'cbi-button',
+						'click': function(ev) {
+							if (ev && ev.preventDefault)
+								ev.preventDefault();
+							logPinned = true;
+							return pullConnLog();
+						}
+					}, [_('连接日志')]),
 					E('button', {
 						'type': 'button',
 						'class': 'cbi-button cbi-button-negative',
@@ -828,7 +885,7 @@ return view.extend({
 				pollTick += 1;
 				var jobs = [pullStatus()];
 				if (pollTick % 3 === 1)
-					jobs.push(pullLog());
+					jobs.push(refreshLog());
 				return Promise.all(jobs);
 			}, 1);
 			window.setInterval(function() {
@@ -839,7 +896,7 @@ return view.extend({
 					pullStatus();
 			}, 300);
 			return E('div', { 'class': 'xa-shell' }, [
-				E('link', { 'rel': 'stylesheet', 'href': L.resource('view/xboxaccel.css') + '?v=1.1.7' }),
+				E('link', { 'rel': 'stylesheet', 'href': L.resource('view/xboxaccel.css') + '?v=1' }),
 				E('div', { 'class': 'xa-hero' }, [
 					E('div', {}, [
 						E('p', { 'class': 'xa-kicker' }, ['Xbox 下载']),

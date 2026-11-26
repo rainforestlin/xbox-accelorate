@@ -3,6 +3,9 @@
 
 import gzip
 import io
+import re
+import subprocess
+import sys
 import tarfile
 from pathlib import Path
 
@@ -10,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 IPK = ROOT / "ipk"
 DIST = ROOT / "dist"
+
+
 def control_value(field: str) -> str:
     for line in (IPK / "control").read_text(encoding="utf-8").splitlines():
         if line.startswith(field + ":"):
@@ -17,12 +22,36 @@ def control_value(field: str) -> str:
     raise SystemExit(f"missing control field {field}")
 
 
+def release_version() -> str:
+    version = (ROOT / "VERSION").read_text(encoding="utf-8").strip()
+    release = (ROOT / "RELEASE").read_text(encoding="utf-8").strip()
+    if not version or not release:
+        raise SystemExit("VERSION and RELEASE must not be empty")
+    return f"{version}-{release}"
+
+
+def git_short() -> str:
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(ROOT), "rev-parse", "--short", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except Exception:
+        return "dev"
+
+
+DEV = "--dev" in sys.argv[1:]
+BASE_VERSION = release_version()
+PKG_VERSION = f"{BASE_VERSION}+git{git_short()}" if DEV else BASE_VERSION
+OUTDIR = DIST / "dev" if DEV else DIST
 NAME = "{0}_{1}_{2}.ipk".format(
-    control_value("Package"), control_value("Version"), control_value("Architecture")
+    control_value("Package"), PKG_VERSION, control_value("Architecture")
 )
 EXEC_PATHS = {
     "./usr/sbin/xboxaccel",
     "./etc/init.d/xboxaccel",
+    "./etc/hotplug.d/iface/99-xboxaccel",
     "./usr/share/xboxaccel/policy",
     "./usr/share/xboxaccel/roster",
     "./usr/share/xboxaccel/redir-run",
@@ -120,7 +149,12 @@ def main() -> None:
     for name in ("control", "conffiles", "postinst", "prerm"):
         path = IPK / name
         mode = 0o755 if name in {"postinst", "prerm"} else 0o644
-        control_files.append(("./" + name, normalize(path.read_bytes(), path), mode))
+        data = path.read_bytes()
+        if name == "control":
+            text = data.decode("utf-8")
+            text = re.sub(r"(?m)^Version:.*$", f"Version: {PKG_VERSION}", text)
+            data = text.encode("utf-8")
+        control_files.append(("./" + name, normalize(data, path), mode))
 
     outer_members = [
         ("./debian-binary", b"2.0\n", 0o644),
@@ -131,8 +165,8 @@ def main() -> None:
     with tarfile.open(fileobj=payload, mode="w", format=tarfile.USTAR_FORMAT) as tar:
         for name, data, mode in outer_members:
             add_bytes(tar, name, data, mode)
-    DIST.mkdir(exist_ok=True)
-    out = DIST / NAME
+    OUTDIR.mkdir(parents=True, exist_ok=True)
+    out = OUTDIR / NAME
     out.write_bytes(gzip_bytes(payload.getvalue()))
     print(out)
 

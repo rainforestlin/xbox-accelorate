@@ -19,6 +19,19 @@ case "$uri" in
 	*) uri=/ ;;
 esac
 
+CONN_LOG=/tmp/xboxaccel.redirect.log
+
+log_conn() {
+	_target="$1"
+	_host=$(printf '%s' "$host" | tr '\011' ' ')
+	_uri=$(printf '%s' "$uri" | tr '\011' ' ')
+	printf '%s\t%s %s %s -> %s\n' \
+		"$(date '+%Y-%m-%d %H:%M:%S')" "${REMOTE_ADDR:-?}" "$_host" "$_uri" "$_target" \
+		>> "$CONN_LOG" 2>/dev/null || return 0
+	[ "$(wc -c < "$CONN_LOG" 2>/dev/null || echo 0)" -gt 131072 ] || return 0
+	tail -c 65536 "$CONN_LOG" > "$CONN_LOG.tmp" 2>/dev/null && mv "$CONN_LOG.tmp" "$CONN_LOG"
+}
+
 target=
 case "$host" in
 	dlassets.xboxlive.com|dlassets2.xboxlive.com)
@@ -27,11 +40,16 @@ case "$host" in
 	assets1.xboxlive.com|assets2.xboxlive.com|d1.xboxlive.com|d2.xboxlive.com|xvcf1.xboxlive.com|xvcf2.xboxlive.com|5.xb.delivery.microsoft.com|assets1.xboxlive.com.edgesuite.net|cl-glcb907925.gcdn.co|fg.microsoft.map.fastly.net)
 		target=assets1.xboxlive.cn
 		;;
+	xvcf1.xboxlive.cn|xvcf2.xboxlive.cn)
+		target=assets1.xboxlive.cn
+		;;
 esac
 
 if [ -z "$target" ]; then
+	log_conn 404
 	printf 'Status: 404 Not Found\r\nContent-Type: text/plain\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
 	exit 0
 fi
 
+log_conn "$target"
 printf 'Status: 302 Found\r\nLocation: http://%s%s\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n' "$target" "$uri"
